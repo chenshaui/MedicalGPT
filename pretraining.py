@@ -28,7 +28,7 @@ import numpy as np
 import torch
 from datasets import load_dataset
 from loguru import logger
-from peft import LoraConfig, TaskType, get_peft_model, PeftModel, prepare_model_for_int8_training
+from peft import LoraConfig, TaskType, get_peft_model, PeftModel, prepare_model_for_kbit_training
 from sklearn.metrics import accuracy_score
 from transformers import (
     AutoConfig,
@@ -41,12 +41,18 @@ from transformers import (
     AutoTokenizer,
     HfArgumentParser,
     Trainer,
-    TrainingArguments,
+    Seq2SeqTrainingArguments,
     is_torch_tpu_available,
     set_seed,
+    BitsAndBytesConfig,
 )
 from transformers.trainer import TRAINING_ARGS_NAME
 from transformers.utils.versions import require_version
+
+try:
+    from transformers.integrations import is_deepspeed_zero3_enabled
+except ImportError:  # https://github.com/huggingface/transformers/releases/tag/v4.33.1
+    from transformers.deepspeed import is_deepspeed_zero3_enabled
 
 MODEL_CLASSES = {
     "bloom": (AutoConfig, BloomForCausalLM, BloomTokenizerFast),
@@ -84,10 +90,16 @@ class ModelArguments:
         },
     )
     load_in_8bit: bool = field(default=False, metadata={"help": "Whether to load the model in 8bit mode or not."})
+    load_in_4bit: bool = field(default=False, metadata={"help": "Whether to load the model in 4bit mode or not."})
     cache_dir: Optional[str] = field(
         default=None,
         metadata={"help": "Where do you want to store the pretrained models downloaded from huggingface.co"},
     )
+    model_revision: Optional[str] = field(
+        default="main",
+        metadata={"help": "The specific model version to use (can be a branch name, tag name or commit id)."},
+    )
+    hf_hub_token: Optional[str] = field(default=None, metadata={"help": "Auth token to log in with Hugging Face Hub."})
     use_fast_tokenizer: bool = field(
         default=False,
         metadata={"help": "Whether to use one of the fast tokenizer (backed by the tokenizers library) or not."},
@@ -121,7 +133,7 @@ class ModelArguments:
 
 
 @dataclass
-class DataTrainingArguments:
+class DataArguments:
     """
     Arguments pertaining to what data we are going to input our model for training and eval.
     """
@@ -189,7 +201,7 @@ class DataTrainingArguments:
 
 
 @dataclass
-class PeftArguments(TrainingArguments):
+class ScriptArguments:
     use_peft: bool = field(default=True, metadata={"help": "Whether to use peft"})
     target_modules: Optional[str] = field(default="all")
     lora_rank: Optional[int] = field(default=8)
@@ -197,6 +209,7 @@ class PeftArguments(TrainingArguments):
     lora_alpha: Optional[float] = field(default=32.0)
     modules_to_save: Optional[str] = field(default=None)
     peft_path: Optional[str] = field(default=None)
+    qlora: bool = field(default=False, metadata={"help": "Whether to use qlora"})
 
 
 def accuracy(predictions, references, normalize=True, sample_weight=None):
@@ -298,15 +311,27 @@ class SavePeftModelTrainer(Trainer):
         self.model.save_pretrained(output_dir)
 
 
-def save_model(output_dir, model, tokenizer, args):
+def save_model(model, tokenizer, args):
     """Save the model and the tokenizer."""
+    output_dir = args.output_dir
     os.makedirs(output_dir, exist_ok=True)
 
     # Take care of distributed/parallel training
     model_to_save = model.module if hasattr(model, "module") else model
     model_to_save.save_pretrained(output_dir)
     tokenizer.save_pretrained(output_dir)
-    torch.save(args, os.path.join(output_dir, TRAINING_ARGS_NAME))
+
+
+def save_model_zero3(model, tokenizer, args, trainer):
+    """Save the model for deepspeed zero3.
+    refer https://github.com/lm-sys/FastChat/blob/main/fastchat/train/train_lora.py#L209
+    """
+    output_dir = args.output_dir
+    os.makedirs(output_dir, exist_ok=True)
+    state_dict_zero3 = trainer.model_wrapped._zero3_consolidated_16bit_state_dict()
+    model_to_save = model.module if hasattr(model, "module") else model
+    model_to_save.save_pretrained(args.output_dir, state_dict=state_dict_zero3)
+    tokenizer.save_pretrained(output_dir)
 
 
 def print_trainable_parameters(model):
@@ -339,19 +364,22 @@ def find_all_linear_names(peft_model, int4=False, int8=False):
             # last layer is not add to lora_module_names
             if 'lm_head' in name:
                 continue
+            if 'output_layer' in name:
+                continue
             names = name.split('.')
             lora_module_names.add(names[0] if len(names) == 1 else names[-1])
     return sorted(lora_module_names)
 
 
 def main():
-    parser = HfArgumentParser((ModelArguments, DataTrainingArguments, PeftArguments))
-    model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+    parser = HfArgumentParser((ModelArguments, DataArguments, Seq2SeqTrainingArguments, ScriptArguments))
+    model_args, data_args, training_args, script_args = parser.parse_args_into_dataclasses()
 
-    logger.warning(f"Model args: {model_args}")
-    logger.warning(f"Data args: {data_args}")
-    logger.warning(f"Training args: {training_args}")
-    logger.warning(
+    logger.info(f"Model args: {model_args}")
+    logger.info(f"Data args: {data_args}")
+    logger.info(f"Training args: {training_args}")
+    logger.info(f"Script args: {script_args}")
+    logger.info(
         f"Process rank: {training_args.local_rank}, device: {training_args.device}, n_gpu: {training_args.n_gpu}"
         + f" distributed training: {bool(training_args.local_rank != -1)}, 16-bits training: {training_args.fp16}"
     )
@@ -360,8 +388,6 @@ def main():
     set_seed(training_args.seed)
 
     # Load tokenizer
-    if not model_args.model_type:
-        raise ValueError("Please specify a model_type, e.g. llama, chatglm, bloom, etc.")
     config_class, model_class, tokenizer_class = MODEL_CLASSES[model_args.model_type]
 
     tokenizer_kwargs = {
@@ -373,10 +399,6 @@ def main():
     if not tokenizer_name_or_path:
         tokenizer_name_or_path = model_args.model_name_or_path
     tokenizer = tokenizer_class.from_pretrained(tokenizer_name_or_path, **tokenizer_kwargs)
-
-    # Preprocessing the datasets.
-    def tokenize_function(examples):
-        return tokenizer(examples["text"])
 
     if data_args.block_size is None:
         block_size = tokenizer.model_max_length
@@ -394,8 +416,25 @@ def main():
             )
         block_size = min(data_args.block_size, tokenizer.model_max_length)
 
+    # Preprocessing the datasets.
+    def tokenize_function(examples):
+        tokenized_inputs = tokenizer(
+            examples["text"],
+            truncation=True,
+            padding='max_length',
+            max_length=block_size
+        )
+        # Copy the input_ids to the labels for language modeling. This is suitable for both
+        # masked language modeling (like BERT) or causal language modeling (like GPT).
+        tokenized_inputs["labels"] = tokenized_inputs["input_ids"].copy()
+
+        return tokenized_inputs
+
+    def tokenize_wo_pad_function(examples):
+        return tokenizer(examples["text"])
+
     # Main data processing function that will concatenate all texts from our dataset and generate chunks of block_size.
-    def group_texts(examples):
+    def group_text_function(examples):
         # Concatenate all texts.
         concatenated_examples = {k: list(chain(*examples[k])) for k in examples.keys()}
         total_length = len(concatenated_examples[list(examples.keys())[0]])
@@ -458,8 +497,8 @@ def main():
             data_files["train"] = train_data_files
         if data_args.validation_file_dir is not None and os.path.exists(data_args.validation_file_dir):
             eval_data_files = glob(f'{data_args.validation_file_dir}/**/*.txt', recursive=True) + glob(
-                f'{data_args.train_file_dir}/**/*.json', recursive=True) + glob(
-                f'{data_args.train_file_dir}/**/*.jsonl', recursive=True)
+                f'{data_args.validation_file_dir}/**/*.json', recursive=True) + glob(
+                f'{data_args.validation_file_dir}/**/*.jsonl', recursive=True)
             logger.info(f"eval files: {eval_data_files}")
             data_files["validation"] = eval_data_files
             # Train data files must be same type, e.g. all txt or all jsonl
@@ -502,36 +541,53 @@ def main():
 
     with training_args.main_process_first(desc="Dataset tokenization and grouping"):
         if not data_args.streaming:
-            tokenized_datasets = raw_datasets.map(
-                tokenize_function,
-                batched=True,
-                num_proc=data_args.preprocessing_num_workers,
-                remove_columns=column_names,
-                load_from_cache_file=not data_args.overwrite_cache,
-                desc="Running tokenizer on dataset",
-            )
-            lm_datasets = tokenized_datasets.map(
-                group_texts,
-                batched=True,
-                num_proc=data_args.preprocessing_num_workers,
-                load_from_cache_file=not data_args.overwrite_cache,
-                desc=f"Grouping texts in chunks of {block_size}",
-            )
+            if training_args.group_by_length:
+                tokenized_datasets = raw_datasets.map(
+                    tokenize_wo_pad_function,
+                    batched=True,
+                    num_proc=data_args.preprocessing_num_workers,
+                    remove_columns=column_names,
+                    load_from_cache_file=not data_args.overwrite_cache,
+                    desc="Running tokenizer on dataset",
+                )
+                lm_datasets = tokenized_datasets.map(
+                    group_text_function,
+                    batched=True,
+                    num_proc=data_args.preprocessing_num_workers,
+                    load_from_cache_file=not data_args.overwrite_cache,
+                    desc=f"Grouping texts in chunks of {block_size}",
+                )
+            else:
+                lm_datasets = raw_datasets.map(
+                    tokenize_function,
+                    batched=True,
+                    num_proc=data_args.preprocessing_num_workers,
+                    remove_columns=column_names,
+                    load_from_cache_file=not data_args.overwrite_cache,
+                    desc="Running tokenizer on dataset",
+                )
         else:
-            tokenized_datasets = raw_datasets.map(
-                tokenize_function,
-                batched=True,
-                remove_columns=column_names,
-            )
-            lm_datasets = tokenized_datasets.map(
-                group_texts,
-                batched=True,
-            )
+            if training_args.group_by_length:
+                tokenized_datasets = raw_datasets.map(
+                    tokenize_wo_pad_function,
+                    batched=True,
+                    remove_columns=column_names,
+                )
+                lm_datasets = tokenized_datasets.map(
+                    group_text_function,
+                    batched=True,
+                )
+            else:
+                lm_datasets = raw_datasets.map(
+                    tokenize_function,
+                    batched=True,
+                    remove_columns=column_names,
+                )
 
     train_dataset = None
     max_train_samples = 0
     if training_args.do_train:
-        if "train" not in tokenized_datasets:
+        if "train" not in lm_datasets:
             raise ValueError("--do_train requires a train dataset")
         train_dataset = lm_datasets['train']
         max_train_samples = len(train_dataset)
@@ -545,7 +601,7 @@ def main():
     eval_dataset = None
     max_eval_samples = 0
     if training_args.do_eval:
-        if "validation" not in tokenized_datasets:
+        if "validation" not in lm_datasets:
             raise ValueError("--do_eval requires a validation dataset")
         eval_dataset = lm_datasets["validation"]
         max_eval_samples = len(eval_dataset)
@@ -563,55 +619,90 @@ def main():
             if model_args.torch_dtype in ["auto", None]
             else getattr(torch, model_args.torch_dtype)
         )
-        world_size = int(os.environ.get("WORLD_SIZE", 1))
+        world_size = int(os.environ.get("WORLD_SIZE", "1"))
         ddp = world_size != 1
         if ddp:
-            model_args.device_map = {"": int(os.environ["LOCAL_RANK"]) or 0}
+            model_args.device_map = {"": int(os.environ.get("LOCAL_RANK", "0"))}
+        if script_args.qlora and (len(training_args.fsdp) > 0 or is_deepspeed_zero3_enabled()):
+            logger.warning("FSDP and DeepSpeed ZeRO-3 are both currently incompatible with QLoRA.")
 
-        config = config_class.from_pretrained(
-            model_args.model_name_or_path,
-            torch_dtype=torch_dtype,
-            trust_remote_code=model_args.trust_remote_code,
-            cache_dir=model_args.cache_dir
-        )
+        config_kwargs = {
+            "trust_remote_code": model_args.trust_remote_code,
+            "cache_dir": model_args.cache_dir,
+            "revision": model_args.model_revision,
+            "token": model_args.hf_hub_token,
+        }
+        config = config_class.from_pretrained(model_args.model_name_or_path, **config_kwargs)
+        load_in_4bit = model_args.load_in_4bit
+        load_in_8bit = model_args.load_in_8bit
+        if load_in_4bit and load_in_8bit:
+            raise ValueError("Error, load_in_4bit and load_in_8bit cannot be set at the same time")
+        elif load_in_8bit or load_in_4bit:
+            logger.info(f"Quantizing model, load_in_4bit: {load_in_4bit}, load_in_8bit: {load_in_8bit}")
+            if is_deepspeed_zero3_enabled():
+                raise ValueError("DeepSpeed ZeRO-3 is incompatible with quantization.")
+            if load_in_8bit:
+                config_kwargs['quantization_config'] = BitsAndBytesConfig(load_in_8bit=True)
+            elif load_in_4bit:
+                if script_args.qlora:
+                    config_kwargs['quantization_config'] = BitsAndBytesConfig(
+                        load_in_4bit=True,
+                        bnb_4bit_use_double_quant=True,
+                        bnb_4bit_quant_type="nf4",
+                        bnb_4bit_compute_dtype=torch_dtype,
+                    )
+                else:
+                    config_kwargs['quantization_config'] = BitsAndBytesConfig(
+                        load_in_4bit=True,
+                        bnb_4bit_compute_dtype=torch_dtype,
+                    )
+
         model = model_class.from_pretrained(
             model_args.model_name_or_path,
             config=config,
-            load_in_8bit=model_args.load_in_8bit,
+            torch_dtype=torch_dtype,
+            low_cpu_mem_usage=(not is_deepspeed_zero3_enabled()),
             device_map=model_args.device_map,
-            trust_remote_code=model_args.trust_remote_code,
+            **config_kwargs,
         )
     else:
         raise ValueError(f"Error, model_name_or_path is None, Continue PT must be loaded from a pre-trained model")
 
-    if training_args.use_peft:
-        if training_args.peft_path is not None:
-            logger.info(f"Peft from pre-trained model: {training_args.peft_path}")
-            model = PeftModel.from_pretrained(model, training_args.peft_path, is_trainable=True)
+    if script_args.use_peft:
+        logger.info("Fine-tuning method: LoRA(PEFT)")
+        if script_args.peft_path is not None:
+            logger.info(f"Peft from pre-trained model: {script_args.peft_path}")
+            model = PeftModel.from_pretrained(model, script_args.peft_path, is_trainable=True)
         else:
             logger.info("Init new peft model")
-            target_modules = training_args.target_modules.split(',') if training_args.target_modules else None
+            if load_in_8bit or load_in_4bit:
+                model = prepare_model_for_kbit_training(model, training_args.gradient_checkpointing)
+            target_modules = script_args.target_modules.split(',') if script_args.target_modules else None
             if target_modules and 'all' in target_modules:
-                target_modules = find_all_linear_names(model, int4=False, int8=model_args.load_in_8bit)
-            modules_to_save = training_args.modules_to_save
+                target_modules = find_all_linear_names(model, int4=load_in_4bit, int8=load_in_8bit)
+            modules_to_save = script_args.modules_to_save
             if modules_to_save is not None:
                 modules_to_save = modules_to_save.split(',')
+                # Resize the embedding layer to match the new tokenizer
+                embedding_size = model.get_input_embeddings().weight.shape[0]
+                if len(tokenizer) > embedding_size:
+                    model.resize_token_embeddings(len(tokenizer))
             logger.info(f"Peft target_modules: {target_modules}")
-            logger.info(f"Peft lora_rank: {training_args.lora_rank}")
+            logger.info(f"Peft lora_rank: {script_args.lora_rank}")
             peft_config = LoraConfig(
                 task_type=TaskType.CAUSAL_LM,
                 target_modules=target_modules,
                 inference_mode=False,
-                r=training_args.lora_rank,
-                lora_alpha=training_args.lora_alpha,
-                lora_dropout=training_args.lora_dropout,
+                r=script_args.lora_rank,
+                lora_alpha=script_args.lora_alpha,
+                lora_dropout=script_args.lora_dropout,
                 modules_to_save=modules_to_save)
             model = get_peft_model(model, peft_config)
-        if model_args.load_in_8bit:
-            model = prepare_model_for_int8_training(model)
+        for param in filter(lambda p: p.requires_grad, model.parameters()):
+            param.data = param.data.to(torch.float32)
         model.print_trainable_parameters()
     else:
-        logger.info("Full parameters training")
+        logger.info("Fine-tuning method: Full parameters training")
         model = model.float()
         print_trainable_parameters(model)
 
@@ -651,12 +742,21 @@ def main():
 
         metrics = train_result.metrics
         metrics["train_samples"] = max_train_samples
-        logger.debug(f"Training metrics: {metrics}")
         trainer.log_metrics("train", metrics)
         trainer.save_metrics("train", metrics)
         trainer.save_state()
-        logger.info(f"Saving model checkpoint to {training_args.output_dir}")
-        save_model(training_args.output_dir, model, tokenizer, training_args)
+
+        model.config.use_cache = True  # enable cache after training
+        tokenizer.padding_side = "left"  # restore padding side
+        tokenizer.init_kwargs["padding_side"] = "left"
+
+        if trainer.is_world_process_zero():
+            logger.debug(f"Training metrics: {metrics}")
+            logger.info(f"Saving model checkpoint to {training_args.output_dir}")
+            if is_deepspeed_zero3_enabled():
+                save_model_zero3(model, tokenizer, training_args, trainer)
+            else:
+                save_model(model, tokenizer, training_args)
 
     # Evaluation
     if training_args.do_eval:
@@ -669,9 +769,11 @@ def main():
         except OverflowError:
             perplexity = float("inf")
         metrics["perplexity"] = perplexity
-        logger.debug(f"Eval metrics: {metrics}")
+
         trainer.log_metrics("eval", metrics)
         trainer.save_metrics("eval", metrics)
+        if trainer.is_world_process_zero():
+            logger.debug(f"Eval metrics: {metrics}")
 
 
 if __name__ == "__main__":

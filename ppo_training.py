@@ -28,6 +28,8 @@ from transformers import (
 )
 from trl import AutoModelForCausalLMWithValueHead, PPOConfig, PPOTrainer, set_seed
 
+from supervised_finetuning import get_conv_template
+
 os.environ["TOKENIZERS_PARALLELISM"] = "FALSE"
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
@@ -38,12 +40,6 @@ MODEL_CLASSES = {
     "baichuan": (AutoConfig, AutoModelForCausalLM, AutoTokenizer),
     "auto": (AutoConfig, AutoModelForCausalLM, AutoTokenizer),
 }
-
-PROMPT_TEMPLATE = (
-    "Below is an instruction that describes a task. "
-    "Write a response that appropriately completes the request.\n\n"
-    "### Instruction:\n{instruction}\n\n### Response: "
-)
 
 
 @dataclass
@@ -60,10 +56,12 @@ class ScriptArguments:
         default=None, metadata={"help": "The model checkpoint for weights initialization."}
     )
     reward_model_name_or_path: Optional[str] = field(default=None, metadata={"help": "The reward model name"})
+    reward_model_device: Optional[str] = field(default="cuda:0", metadata={"help": "The reward model device"})
     tokenizer_name_or_path: Optional[str] = field(
         default=None, metadata={"help": "The tokenizer for weights initialization."}
     )
     load_in_8bit: bool = field(default=False, metadata={"help": "Whether to load the model in 8bit mode or not."})
+    load_in_4bit: bool = field(default=False, metadata={"help": "Whether to load the model in 4bit mode or not."})
     cache_dir: Optional[str] = field(
         default=None,
         metadata={"help": "Where do you want to store the pretrained models downloaded from huggingface.co"},
@@ -99,6 +97,7 @@ class ScriptArguments:
     )
     train_file_dir: Optional[str] = field(default=None, metadata={"help": "The input jsonl data file folder."})
     validation_file_dir: Optional[str] = field(default=None, metadata={"help": "The evaluation jsonl file folder."}, )
+    template_name: Optional[str] = field(default="vicuna", metadata={"help": "The template name."})
     batch_size: Optional[int] = field(default=8, metadata={"help": "Batch size"})
     mini_batch_size: Optional[int] = field(default=1, metadata={"help": "PPO minibatch size"})
     max_source_length: Optional[int] = field(default=256, metadata={"help": "Max length of prompt input text"})
@@ -142,7 +141,7 @@ class ScriptArguments:
     lora_alpha: Optional[float] = field(default=32.0)
     modules_to_save: Optional[str] = field(default=None)
     peft_path: Optional[str] = field(default=None)
-
+    # PPO arguments
     do_train: bool = field(default=False, metadata={"help": "Whether to run training."})
     do_eval: bool = field(default=False, metadata={"help": "Whether to run eval on the validation set."})
     early_stopping: Optional[bool] = field(default=False, metadata={"help": "Whether to early stop"})
@@ -160,9 +159,9 @@ class ScriptArguments:
     )
     save_steps: Optional[int] = field(default=50, metadata={"help": "X steps to save the model"})
     output_dir: Optional[str] = field(default="outputs-rl", metadata={"help": "The output directory"})
-    seed: Optional[int] = field(default=0, metadata={"help": "the seed"})
-    max_steps: Optional[int] = field(default=200, metadata={"help": "number of steps to train"})
-    log_with: Optional[str] = field(default="tensorboard", metadata={"help": "log with wandb or tensorboard"})
+    seed: Optional[int] = field(default=0, metadata={"help": "Seed"})
+    max_steps: Optional[int] = field(default=200, metadata={"help": "Number of steps to train"})
+    report_to: Optional[str] = field(default="tensorboard", metadata={"help": "Report to wandb or tensorboard"})
 
     def __post_init__(self):
         if self.model_type is None:
@@ -171,6 +170,8 @@ class ScriptArguments:
             raise ValueError("You must specify a valid model_name_or_path to run training.")
         if self.reward_model_name_or_path is None:
             raise ValueError("You must specify a valid reward_model_name_or_path to run training.")
+        if self.max_source_length < 60:
+            raise ValueError("You must specify a valid max_source_length >= 60 to run training")
 
 
 def print_trainable_parameters(model):
@@ -220,8 +221,7 @@ def calculate_rewards(reward_score_outputs, reward_baseline=0):
 def main():
     parser = HfArgumentParser(ScriptArguments)
     args = parser.parse_args_into_dataclasses()[0]
-
-    logger.warning(f"Parse args: {args}")
+    logger.info(f"Parse args: {args}")
 
     config_class, model_class, tokenizer_class = MODEL_CLASSES[args.model_type]
     if args.model_type == 'bloom':
@@ -236,27 +236,31 @@ def main():
     if not tokenizer_name_or_path:
         tokenizer_name_or_path = args.model_name_or_path
     tokenizer = tokenizer_class.from_pretrained(tokenizer_name_or_path, **tokenizer_kwargs)
-    # Required for llama
-    if args.model_type == "llama" and tokenizer.pad_token is None:
-        tokenizer.add_special_tokens({"pad_token": "[PAD]"})
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token_id = 0  # set as the <unk> token
 
-    logger.info("Load model")
-    peft_config = LoraConfig(
-        task_type=TaskType.CAUSAL_LM,
-        target_modules=args.target_modules,
-        inference_mode=False,
-        r=args.lora_rank,
-        lora_alpha=args.lora_alpha,
-        lora_dropout=args.lora_dropout,
-    )
+    # Load model
+    peft_config = None
+    if args.use_peft:
+        logger.info("Fine-tuning method: LoRA(PEFT)")
+        peft_config = LoraConfig(
+            task_type=TaskType.CAUSAL_LM,
+            target_modules=args.target_modules,
+            inference_mode=False,
+            r=args.lora_rank,
+            lora_alpha=args.lora_alpha,
+            lora_dropout=args.lora_dropout,
+        )
+    else:
+        logger.info("Fine-tuning method: Full parameters training")
     torch_dtype = (
         args.torch_dtype
         if args.torch_dtype in ["auto", None]
         else getattr(torch, args.torch_dtype)
     )
-    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
     if world_size > 1:
-        args.device_map = {"": int(os.environ["LOCAL_RANK"]) or 0}
+        args.device_map = {"": int(os.environ.get("LOCAL_RANK", "0"))}
     config = config_class.from_pretrained(
         args.model_name_or_path,
         torch_dtype=torch_dtype,
@@ -266,17 +270,29 @@ def main():
     model = AutoModelForCausalLMWithValueHead.from_pretrained(
         args.model_name_or_path,
         config=config,
+        torch_dtype=torch_dtype,
+        load_in_4bit=args.load_in_4bit,
         load_in_8bit=args.load_in_8bit,
         device_map=args.device_map,
         trust_remote_code=args.trust_remote_code,
         peft_config=peft_config if args.use_peft else None,
     )
+    for param in filter(lambda p: p.requires_grad, model.parameters()):
+        param.data = param.data.to(torch.float32)
+
     print_trainable_parameters(model)
     # Load reward model
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    default_device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = args.reward_model_device if args.reward_model_device is not None else default_device
+    reward_config = config_class.from_pretrained(
+        args.reward_model_name_or_path,
+        torch_dtype=torch_dtype,
+        trust_remote_code=args.trust_remote_code,
+        cache_dir=args.cache_dir
+    )
     reward_model = AutoModelForSequenceClassification.from_pretrained(
         args.reward_model_name_or_path,
-        config=config,
+        config=reward_config,
         load_in_8bit=args.load_in_8bit,
         trust_remote_code=args.trust_remote_code,
     )
@@ -342,24 +358,47 @@ def main():
     # Preprocessing the datasets
     max_source_length = args.max_source_length
     max_target_length = args.max_target_length
+    prompt_template = get_conv_template(args.template_name)
 
     def preprocess_function(examples):
         new_examples = {
             "query": [],
             "input_ids": [],
         }
-        for conversation in examples['conversations']:
-            for message in conversation:
-                instruction = message['value']
-                input = message['from']
-                if input:
-                    instruction = instruction + "\n" + input
-                source = PROMPT_TEMPLATE.format_map({"instruction": instruction})
+        roles = ["human", "gpt"]
+
+        def get_prompt(examples):
+            for i, source in enumerate(examples['conversations']):
+                if len(source) < 2:
+                    continue
+                data_role = source[0].get("from", "")
+                if data_role not in roles or data_role != roles[0]:
+                    # Skip the first one if it is not from human
+                    source = source[1:]
+                if len(source) < 2:
+                    continue
+                messages = []
+                for j, sentence in enumerate(source):
+                    data_role = sentence.get("from", "")
+                    if data_role not in roles:
+                        logger.warning(f"unknown role: {data_role}, {i}. (ignored)")
+                        break
+                    if data_role == roles[j % 2]:
+                        messages.append(sentence["value"])
+                if len(messages) < 2 or len(messages) % 2 != 0:
+                    continue
+                # Convert the list to pairs of elements
+                history_messages = [[messages[k], messages[k + 1]] for k in range(0, len(messages), 2)]
+                yield prompt_template.get_prompt(history_messages)
+
+        for prompt in get_prompt(examples):
+            for i in range(len(prompt) // 2):
+                source_txt = prompt[2 * i]
                 tokenized_question = tokenizer(
-                    source, truncation=True, max_length=max_source_length, padding="max_length",
+                    source_txt, truncation=True, max_length=max_source_length, padding="max_length",
                     return_tensors="pt"
                 )
-                new_examples["query"].append(source)
+                new_examples["query"].append(source_txt)
                 new_examples["input_ids"].append(tokenized_question["input_ids"])
 
         return new_examples
@@ -395,7 +434,7 @@ def main():
         steps=args.max_steps,
         model_name=args.model_name_or_path,
         learning_rate=args.learning_rate,
-        log_with=args.log_with,
+        log_with=args.report_to,
         batch_size=args.batch_size,
         mini_batch_size=args.mini_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
@@ -428,10 +467,6 @@ def main():
         "top_p": 1.0,
         "do_sample": True,
     }
-
-    def save_model(save_dir):
-        trainer.accelerator.unwrap_model(trainer.model).save_pretrained(save_dir)
-        trainer.tokenizer.save_pretrained(save_dir)
 
     # Training
     if args.do_train:
@@ -472,9 +507,9 @@ def main():
 
             if step and step % args.save_steps == 0:
                 save_dir = os.path.join(output_dir, f"checkpoint-{step}")
-                save_model(save_dir)
+                trainer.save_pretrained(save_dir)
         # Save final model
-        save_model(output_dir)
+        trainer.save_pretrained(output_dir)
 
 
 if __name__ == "__main__":

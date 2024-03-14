@@ -10,6 +10,7 @@ from threading import Thread
 
 import torch
 from peft import PeftModel
+from tqdm import tqdm
 from transformers import (
     AutoModel,
     AutoModelForCausalLM,
@@ -41,10 +42,12 @@ def stream_generate_answer(
         device,
         do_print=True,
         max_new_tokens=512,
-        temperature=0.7,
+        do_sample=False,
         repetition_penalty=1.0,
-        context_len=2048
+        context_len=2048,
+        stop_str="</s>",
 ):
+    """Generate answer from prompt with GPT and stream the output"""
     streamer = TextIteratorStreamer(tokenizer, timeout=60.0, skip_prompt=True, skip_special_tokens=True)
     input_ids = tokenizer(prompt).input_ids
     max_src_len = context_len - max_new_tokens - 8
@@ -52,13 +55,13 @@ def stream_generate_answer(
     generation_kwargs = dict(
         input_ids=torch.as_tensor([input_ids]).to(device),
         max_new_tokens=max_new_tokens,
-        temperature=temperature,
+        do_sample=do_sample,
         repetition_penalty=repetition_penalty,
         streamer=streamer,
     )
     thread = Thread(target=model.generate, kwargs=generation_kwargs)
     thread.start()
-    stop_str = tokenizer.eos_token or "</s>"
+
     generated_text = ""
     for new_text in streamer:
         stop = False
@@ -76,6 +79,42 @@ def stream_generate_answer(
     return generated_text
 
 
+@torch.inference_mode()
+def batch_generate_answer(
+        sentences,
+        model,
+        tokenizer,
+        prompt_template,
+        device,
+        max_new_tokens=512,
+        do_sample=False,
+        repetition_penalty=1.0,
+        stop_str="</s>",
+):
+    """Generate answer from prompt with GPT, batch mode"""
+    generated_texts = []
+    generation_kwargs = dict(
+        max_new_tokens=max_new_tokens,
+        do_sample=do_sample,
+        repetition_penalty=repetition_penalty,
+    )
+    prompts = [prompt_template.get_prompt(messages=[[s, '']]) for s in sentences]
+    inputs_tokens = tokenizer(prompts, return_tensors="pt", padding=True)
+    input_ids = inputs_tokens['input_ids'].to(device)
+    outputs = model.generate(input_ids=input_ids, **generation_kwargs)
+    for gen_sequence in outputs:
+        prompt_len = len(input_ids[0])
+        gen_sequence = gen_sequence[prompt_len:]
+        gen_text = tokenizer.decode(gen_sequence, skip_special_tokens=True)
+        pos = gen_text.find(stop_str)
+        if pos != -1:
+            gen_text = gen_text[:pos]
+        gen_text = gen_text.strip()
+        generated_texts.append(gen_text)
+
+    return generated_texts
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--model_type', default=None, type=str, required=True)
@@ -83,24 +122,24 @@ def main():
     parser.add_argument('--lora_model', default="", type=str, help="If None, perform inference on the base model")
     parser.add_argument('--tokenizer_path', default=None, type=str)
     parser.add_argument('--template_name', default="vicuna", type=str,
-                        help="Prompt template name, eg: alpaca, vicuna, baichuan-chat, chatglm2 etc.")
-    parser.add_argument("--temperature", type=float, default=0.7)
+                        help="Prompt template name, eg: alpaca, vicuna, baichuan, chatglm2 etc.")
     parser.add_argument("--repetition_penalty", type=float, default=1.0)
     parser.add_argument("--max_new_tokens", type=int, default=512)
     parser.add_argument('--data_file', default=None, type=str,
                         help="A file that contains instructions (one instruction per line)")
-    parser.add_argument('--interactive', action='store_true', help="run in the instruction mode (single-turn)")
-    parser.add_argument('--predictions_file', default='./predictions.json', type=str)
+    parser.add_argument('--interactive', action='store_true', help="run in the instruction mode (default multi-turn)")
+    parser.add_argument('--single_tune', action='store_true', help='Whether to use single-tune model')
+    parser.add_argument('--do_sample', action='store_true', help='Whether to use sampling in generation')
+    parser.add_argument('--output_file', default='./predictions_result.jsonl', type=str)
+    parser.add_argument("--eval_batch_size", type=int, default=4)
     parser.add_argument('--resize_emb', action='store_true', help='Whether to resize model token embeddings')
-    parser.add_argument('--gpus', default="0", type=str)
     parser.add_argument('--only_cpu', action='store_true', help='only use CPU for inference')
+    parser.add_argument('--load_in_8bit', action='store_true', help='Whether to load model in 8bit')
+    parser.add_argument('--load_in_4bit', action='store_true', help='Whether to load model in 4bit')
     args = parser.parse_args()
     print(args)
-    if args.only_cpu is True:
-        args.gpus = ""
-    os.environ["CUDA_VISIBLE_DEVICES"] = args.gpus
     load_type = torch.float16
-    if torch.cuda.is_available():
+    if torch.cuda.is_available() and not args.only_cpu:
         device = torch.device(0)
     else:
         device = torch.device('cpu')
@@ -108,10 +147,11 @@ def main():
         args.tokenizer_path = args.base_model
 
     model_class, tokenizer_class = MODEL_CLASSES[args.model_type]
-    tokenizer = tokenizer_class.from_pretrained(args.tokenizer_path, trust_remote_code=True)
+    tokenizer = tokenizer_class.from_pretrained(args.tokenizer_path, trust_remote_code=True, padding_side='left')
     base_model = model_class.from_pretrained(
         args.base_model,
-        load_in_8bit=False,
+        load_in_8bit=args.load_in_8bit,
+        load_in_4bit=args.load_in_4bit,
         torch_dtype=load_type,
         low_cpu_mem_usage=True,
         device_map='auto',
@@ -151,6 +191,7 @@ def main():
 
     # Chat
     prompt_template = get_conv_template(args.template_name)
+    stop_str = tokenizer.eos_token if tokenizer.eos_token else prompt_template.stop_str
 
     if args.interactive:
         print("Welcome to the CLI application, use `clear` to remove the history, use `exit` to exit the application.")
@@ -175,6 +216,8 @@ def main():
                 continue
 
             print(f"{prompt_template.roles[1]}: ", end="", flush=True)
+            if args.single_tune:
+                history = []
 
             history.append([query, ''])
             prompt = prompt_template.get_prompt(messages=history)
@@ -185,36 +228,48 @@ def main():
                 device,
                 do_print=True,
                 max_new_tokens=args.max_new_tokens,
-                temperature=args.temperature,
-                repetition_penalty=args.repetition_penalty
+                do_sample=args.do_sample,
+                repetition_penalty=args.repetition_penalty,
+                stop_str=stop_str,
             )
             if history:
                 history[-1][-1] = response.strip()
     else:
         print("Start inference.")
-        results = []
-        for index, example in enumerate(examples):
-            # Single turn inference
-            history = [[example, '']]
-            prompt = prompt_template.get_prompt(messages=history)
-            response = stream_generate_answer(
+        counts = 0
+        if os.path.exists(args.output_file):
+            os.remove(args.output_file)
+        eval_batch_size = args.eval_batch_size
+        for batch in tqdm(
+                [
+                    examples[i: i + eval_batch_size]
+                    for i in range(0, len(examples), eval_batch_size)
+                ],
+                desc="Generating outputs",
+        ):
+            responses = batch_generate_answer(
+                batch,
                 model,
                 tokenizer,
-                prompt,
+                prompt_template,
                 device,
-                do_print=False,
                 max_new_tokens=args.max_new_tokens,
-                temperature=args.temperature,
-                repetition_penalty=args.repetition_penalty
+                do_sample=args.do_sample,
+                repetition_penalty=args.repetition_penalty,
+                stop_str=stop_str,
             )
-            response = response.strip()
-            print(f"======={index}=======")
-            print(f"Input: {example}\n")
-            print(f"Output: {response}\n")
-            results.append({"Input": prompt, "Output": response})
-
-        with open(args.predictions_file, 'w', encoding='utf-8') as f:
-            json.dump(results, f, ensure_ascii=False, indent=2)
+            results = []
+            for example, response in zip(batch, responses):
+                print(f"===")
+                print(f"Input: {example}")
+                print(f"Output: {response}\n")
+                results.append({"Input": example, "Output": response})
+                counts += 1
+            with open(args.output_file, 'a', encoding='utf-8') as f:
+                for entry in results:
+                    json.dump(entry, f, ensure_ascii=False)
+                    f.write('\n')
+        print(f'save to {args.output_file}, size: {counts}')
 
 
 if __name__ == '__main__':

@@ -15,20 +15,29 @@
 [![License Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![python_version](https://img.shields.io/badge/Python-3.8%2B-green.svg)](requirements.txt)
 [![GitHub issues](https://img.shields.io/github/issues/shibing624/MedicalGPT.svg)](https://github.com/shibing624/MedicalGPT/issues)
-[![Wechat Group](http://vlog.sfyc.ltd/wechat_everyday/wxgroup_logo.png?imageView2/0/w/60/h/20)](#Contact)
+[![Wechat Group](https://img.shields.io/badge/wechat-group-green.svg?logo=wechat)](#Contact)
 
 ## 📖 Introduction
 
 **MedicalGPT** training medical GPT model with ChatGPT training pipeline, implemantation of Pretraining, 
-Supervised Finetuning, Reward Modeling and Reinforcement Learning.
+Supervised Finetuning, RLHF(Reward Modeling and Reinforcement Learning) and DPO(Direct Preference Optimization).
 
-**MedicalGPT** 训练医疗大模型，实现包括二次预训练、有监督微调、奖励建模、强化学习训练。
+**MedicalGPT** 训练医疗大模型，实现了包括增量预训练、有监督微调、RLHF(奖励建模、强化学习训练)和DPO(直接偏好优化)。
 
-<img src="https://github.com/shibing624/MedicalGPT/blob/main/docs/GPT_Training.jpg" width="860" />
+<img src="https://github.com/shibing624/MedicalGPT/blob/main/docs/dpo.jpg" width="860" />
 
-分四阶段训练GPT模型，来自Andrej Karpathy的演讲PDF [State of GPT](https://karpathy.ai/stateofgpt.pdf)，视频 [Video](https://build.microsoft.com/en-US/sessions/db3f4859-cd30-4445-a0cd-553c3304f8e2)
+- RLHF training pipeline来自Andrej Karpathy的演讲PDF [State of GPT](https://karpathy.ai/stateofgpt.pdf)，视频 [Video](https://build.microsoft.com/en-US/sessions/db3f4859-cd30-4445-a0cd-553c3304f8e2)
+- DPO方法来自论文[Direct Preference Optimization:Your Language Model is Secretly a Reward Model](https://arxiv.org/pdf/2305.18290.pdf)
 
 ## 🔥 News
+[2024/01/26] v1.8版本：支持微调Mixtral混合专家MoE模型 **[Mixtral 8x7B](https://huggingface.co/mistralai/Mixtral-8x7B-v0.1)**。详见[Release-v1.8](https://github.com/shibing624/MedicalGPT/releases/tag/1.8.0)
+
+[2024/01/14] v1.7版本：新增检索增强生成(RAG)的基于文件问答[ChatPDF](https://github.com/shibing624/ChatPDF)功能，代码`chatpdf.py`，可以基于微调后的LLM结合知识库文件问答提升行业问答准确率。详见[Release-v1.7](https://github.com/shibing624/MedicalGPT/releases/tag/1.7.0)
+
+[2023/10/23] v1.6版本：新增RoPE插值来扩展GPT模型的上下文长度；针对LLaMA模型支持了[FlashAttention-2](https://github.com/Dao-AILab/flash-attention)和[LongLoRA](https://github.com/dvlab-research/LongLoRA) 提出的 **$S^2$-Attn**；支持了[NEFTune](https://github.com/neelsjain/NEFTune)给embedding加噪训练方法。详见[Release-v1.6](https://github.com/shibing624/MedicalGPT/releases/tag/1.6.0)
+
+[2023/08/28] v1.5版本: 新增[DPO(直接偏好优化)](https://arxiv.org/pdf/2305.18290.pdf)方法，DPO通过直接优化语言模型来实现对其行为的精确控制，可以有效学习到人类偏好。详见[Release-v1.5](https://github.com/shibing624/MedicalGPT/releases/tag/1.5.0)
+
 [2023/08/08] v1.4版本: 发布基于ShareGPT4数据集微调的中英文Vicuna-13B模型[shibing624/vicuna-baichuan-13b-chat](https://huggingface.co/shibing624/vicuna-baichuan-13b-chat)，和对应的LoRA模型[shibing624/vicuna-baichuan-13b-chat-lora](https://huggingface.co/shibing624/vicuna-baichuan-13b-chat-lora)，详见[Release-v1.4](https://github.com/shibing624/MedicalGPT/releases/tag/1.4.0)
 
 [2023/08/02] v1.3版本: 新增LLaMA, LLaMA2, Bloom, ChatGLM, ChatGLM2, Baichuan模型的多轮对话微调训练；新增领域词表扩充功能；新增中文预训练数据集和中文ShareGPT微调训练集，详见[Release-v1.3](https://github.com/shibing624/MedicalGPT/releases/tag/1.3.0)
@@ -40,13 +49,20 @@ Supervised Finetuning, Reward Modeling and Reinforcement Learning.
 [2023/06/05] v0.2版本: 以医疗为例，训练领域大模型，实现了四阶段训练：包括二次预训练、有监督微调、奖励建模、强化学习训练。详见[Release-v0.2](https://github.com/shibing624/MedicalGPT/releases/tag/0.2.0)
 
 
-## 😊 Feature
-基于ChatGPT Training Pipeline，本项目实现了领域模型--医疗模型的四阶段训练：
+## 😊 Features
 
-- 第一阶段：PT(Continue PreTraining)增量预训练，在海量领域文档数据上二次预训练GPT模型，以注入领域知识
-- 第二阶段：SFT(Supervised Fine-tuning)有监督微调，构造指令微调数据集，在预训练模型基础上做指令精调，以对齐指令意图
-- 第三阶段：RM(Reward Model)奖励模型建模，构造人类偏好排序数据集，训练奖励模型，用来对齐人类偏好，主要是"HHH"原则，具体是"helpful, honest, harmless"
-- 第四阶段：RL(Reinforcement Learning)基于人类反馈的强化学习(RLHF)，用奖励模型来训练SFT模型，生成模型使用奖励或惩罚来更新其策略，以便生成更高质量、更符合人类偏好的文本
+
+基于ChatGPT Training Pipeline，本项目实现了领域模型--医疗行业语言大模型的训练：
+
+
+- 第一阶段：PT(Continue PreTraining)增量预训练，在海量领域文档数据上二次预训练GPT模型，以适应领域数据分布（可选）
+- 第二阶段：SFT(Supervised Fine-tuning)有监督微调，构造指令微调数据集，在预训练模型基础上做指令精调，以对齐指令意图，并注入领域知识
+- 第三阶段 
+  - RLHF(Reinforcement Learning from Human Feedback)基于人类反馈对语言模型进行强化学习，分为两步：
+    - RM(Reward Model)奖励模型建模，构造人类偏好排序数据集，训练奖励模型，用来建模人类偏好，主要是"HHH"原则，具体是"helpful, honest, harmless"
+    - RL(Reinforcement Learning)强化学习，用奖励模型来训练SFT模型，生成模型使用奖励或惩罚来更新其策略，以便生成更高质量、更符合人类偏好的文本
+  - [DPO(Direct Preference Optimization)](https://arxiv.org/pdf/2305.18290.pdf)直接偏好优化方法，DPO通过直接优化语言模型来实现对其行为的精确控制，而无需使用复杂的强化学习，也可以有效学习到人类偏好，DPO相较于RLHF更容易实现且易于训练，效果更好
+
 
 
 ### Release Models
@@ -79,8 +95,8 @@ CUDA_VISIBLE_DEVICES=0 python gradio_demo.py --model_type base_model_type --base
 - `--base_model {base_model}`：存放HF格式的LLaMA模型权重和配置文件的目录，也可使用HF Model Hub模型调用名称
 - `--lora_model {lora_model}`：LoRA文件所在目录，也可使用HF Model Hub模型调用名称。若lora权重已经合并到预训练模型，则删除--lora_model参数
 - `--tokenizer_path {tokenizer_path}`：存放对应tokenizer的目录。若不提供此参数，则其默认值与--base_model相同
+- `--template_name`：模板名称，如`vicuna`、`alpaca`等。若不提供此参数，则其默认值是vicuna
 - `--only_cpu`: 仅使用CPU进行推理
-- `--gpus {gpu_ids}`: 指定使用的GPU设备编号，默认为0。如使用多张GPU，以逗号分隔，如0,1,2
 - `--resize_emb`：是否调整embedding大小，若不调整，则使用预训练模型的embedding大小，默认不调整
 
 
@@ -90,28 +106,60 @@ From time to time, the `requirements.txt` changes. To update, use this command:
 
 ```markdown
 git clone https://github.com/shibing624/MedicalGPT
-conda activate gpt
 cd MedicalGPT
 pip install -r requirements.txt --upgrade
 ```
+
+#### Hardware Requirement
+
+
+| 训练方法 | 精度 |   7B  |  13B  |  30B  |   65B  |   8x7B |
+| ------- | ---- | ----- | ----- | ----- | ------ | ------ |
+| 全参数   |  16  | 160GB | 320GB | 600GB | 1200GB |  900GB |
+| LoRA    |  16  |  16GB |  32GB |  80GB |  160GB |  120GB |
+| QLoRA   |   8  |  10GB |  16GB |  40GB |   80GB |   80GB |
+| QLoRA   |   4  |   6GB |  12GB |  24GB |   48GB |   32GB |
 
 ## 🚀 Training Pipeline
 
 Training Stage:
 
-| Stage                           | Introduction |  Python script                                                                                                           | Shell script                                                                        |                      
-|:--------------------------------|:-------------|:------------------------------------------------------------------------------------------------------------------------|:------------------------------------------------------------------------------------|
-| Stage 1: Continue Pretraining   | 增量预训练        |          [pretraining.py](https://github.com/shibing624/MedicalGPT/blob/main/pretraining.py)                     | [run_pt.sh](https://github.com/shibing624/MedicalGPT/blob/main/run_pt.sh)   | 
-| Stage 2: Supervised Fine-tuning | 有监督微调        | [supervised_finetuning.py](https://github.com/shibing624/MedicalGPT/blob/main/supervised_finetuning.py) | [run_sft.sh](https://github.com/shibing624/MedicalGPT/blob/main/run_sft.sh) | 
-| Stage 3: Reward Modeling        | 奖励模型建模       | [reward_modeling.py](https://github.com/shibing624/MedicalGPT/blob/main/reward_modeling.py)             | [run_rm.sh](https://github.com/shibing624/MedicalGPT/blob/main/run_rm.sh)   | 
-| Stage 4: Reinforcement Learning | 强化学习         |  [rl_training.py](https://github.com/shibing624/MedicalGPT/blob/main/rl_training.py)                     | [run_rl.sh](https://github.com/shibing624/MedicalGPT/blob/main/run_rl.sh)   | 
+| Stage                           | Introduction | Python script                                                                                           | Shell script                                                                |                      
+|:--------------------------------|:-------------|:--------------------------------------------------------------------------------------------------------|:----------------------------------------------------------------------------|
+| Continue Pretraining            | 增量预训练        | [pretraining.py](https://github.com/shibing624/MedicalGPT/blob/main/pretraining.py)                     | [run_pt.sh](https://github.com/shibing624/MedicalGPT/blob/main/run_pt.sh)   | 
+| Supervised Fine-tuning          | 有监督微调        | [supervised_finetuning.py](https://github.com/shibing624/MedicalGPT/blob/main/supervised_finetuning.py) | [run_sft.sh](https://github.com/shibing624/MedicalGPT/blob/main/run_sft.sh) | 
+| Direct Preference Optimization  | 直接偏好优化       | [dpo_training.py](https://github.com/shibing624/MedicalGPT/blob/main/dpo_training.py)                   | [run_dpo.sh](https://github.com/shibing624/MedicalGPT/blob/main/run_dpo.sh) | 
+| Reward Modeling                 | 奖励模型建模       | [reward_modeling.py](https://github.com/shibing624/MedicalGPT/blob/main/reward_modeling.py)             | [run_rm.sh](https://github.com/shibing624/MedicalGPT/blob/main/run_rm.sh)   | 
+| Reinforcement Learning          | 强化学习         | [ppo_training.py](https://github.com/shibing624/MedicalGPT/blob/main/ppo_training.py)                     | [run_ppo.sh](https://github.com/shibing624/MedicalGPT/blob/main/run_ppo.sh)   | 
 
-- 提供完整四阶段串起来训练的pipeline：[run_training_pipeline.ipynb](https://github.com/shibing624/MedicalGPT/blob/main/run_training_pipeline.ipynb) ，其对应的colab： [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/shibing624/MedicalGPT/blob/main/run_training_pipeline.ipynb) ，运行完大概需要15分钟，我运行成功后的副本colab：[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/1RGkbev8D85gR33HJYxqNdnEThODvGUsS?usp=sharing)
-- [训练参数说明wiki](https://github.com/shibing624/MedicalGPT/wiki/%E8%AE%AD%E7%BB%83%E5%8F%82%E6%95%B0%E8%AF%B4%E6%98%8E)
-- [数据集wiki](https://github.com/shibing624/MedicalGPT/wiki/%E6%95%B0%E6%8D%AE%E9%9B%86)
-- [扩充词表wiki](https://github.com/shibing624/MedicalGPT/wiki/%E6%89%A9%E5%85%85%E4%B8%AD%E6%96%87%E8%AF%8D%E8%A1%A8)
-- [FAQ](https://github.com/shibing624/MedicalGPT/wiki/FAQ)
+- 提供完整PT+SFT+DPO全阶段串起来训练的pipeline：[run_training_dpo_pipeline.ipynb](https://github.com/shibing624/MedicalGPT/blob/main/run_training_dpo_pipeline.ipynb) ，其对应的colab： [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/shibing624/MedicalGPT/blob/main/run_training_dpo_pipeline.ipynb)，运行完大概需要15分钟，我运行成功后的副本colab：[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/1kMIe3pTec2snQvLBA00Br8ND1_zwy3Gr?usp=sharing)
+- 提供完整PT+SFT+RLHF全阶段串起来训练的pipeline：[run_training_ppo_pipeline.ipynb](https://github.com/shibing624/MedicalGPT/blob/main/run_training_ppo_pipeline.ipynb) ，其对应的colab： [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/shibing624/MedicalGPT/blob/main/run_training_ppo_pipeline.ipynb) ，运行完大概需要20分钟，我运行成功后的副本colab：[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/1RGkbev8D85gR33HJYxqNdnEThODvGUsS?usp=sharing)
+- 提供基于知识库文件的LLM问答功能（RAG）：[chatpdf.py](https://github.com/shibing624/MedicalGPT/blob/main/chatpdf.py)
+- [训练参数说明](https://github.com/shibing624/MedicalGPT/blob/main/docs/training_params.md) | [训练参数说明wiki](https://github.com/shibing624/MedicalGPT/wiki/%E8%AE%AD%E7%BB%83%E5%8F%82%E6%95%B0%E8%AF%B4%E6%98%8E)
+- [数据集](https://github.com/shibing624/MedicalGPT/blob/main/docs/datasets.md) | [数据集wiki](https://github.com/shibing624/MedicalGPT/wiki/%E6%95%B0%E6%8D%AE%E9%9B%86)
+- [扩充词表](https://github.com/shibing624/MedicalGPT/blob/main/docs/extend_vocab.md) | [扩充词表wiki](https://github.com/shibing624/MedicalGPT/wiki/%E6%89%A9%E5%85%85%E4%B8%AD%E6%96%87%E8%AF%8D%E8%A1%A8)
+- [FAQ](https://github.com/shibing624/MedicalGPT/blob/main/docs/FAQ.md) | [FAQ_wiki](https://github.com/shibing624/MedicalGPT/wiki/FAQ)
+
 #### Supported Models
+
+| Model Name                                                            | Model Size                  | Template  |
+|-----------------------------------------------------------------------|-----------------------------|-----------|
+| [BLOOMZ](https://huggingface.co/bigscience/bloomz)                    | 560M/1.1B/1.7B/3B/7.1B/176B | vicuna    |
+| [LLaMA](https://github.com/facebookresearch/llama)                    | 7B/13B/33B/65B              | alpaca    |
+| [LLaMA2](https://huggingface.co/meta-llama)                           | 7B/13B/70B                  | llama2    |
+| [Mistral](https://huggingface.co/mistralai/Mistral-7B-Instruct-v0.1)  | 7B/8x7B                     | mistral   |
+| [Baichuan](https://github.com/baichuan-inc/baichuan-13B)              | 7B/13B                      | baichuan  |
+| [Baichuan2](https://github.com/baichuan-inc/Baichuan2)                | 7B/13B                      | baichuan2 |
+| [InternLM](https://github.com/InternLM/InternLM)                      | 7B                          | intern    |
+| [Qwen](https://github.com/QwenLM/Qwen)                                | 1.8B/7B/14B/72B             | chatml    |
+| [XVERSE](https://github.com/xverse-ai/XVERSE-13B)                     | 13B                         | xverse    |
+| [ChatGLM](https://github.com/THUDM/ChatGLM-6B)                        | 6B                          | chatglm   |
+| [ChatGLM2](https://github.com/THUDM/ChatGLM2-6B)                      | 6B                          | chatglm2  |
+| [ChatGLM3](https://github.com/THUDM/ChatGLM3)                         | 6B                          | chatglm3  |
+| [Yi](https://github.com/01-ai/Yi)                                     | 6B/34B                      | yi        |
+| [DeepSeek](https://github.com/deepseek-ai/DeepSeek-LLM)               | 7B/16B/67B                  | deepseek  |
+| [Orion](https://github.com/OrionStarAI/Orion)                         | 14B                         | orion     |
+
 The following models are tested:
 
 bloom:
@@ -130,15 +178,32 @@ llama:
 llama2:
 - [daryl149/llama-2-7b-chat-hf](https://huggingface.co/daryl149/llama-2-7b-chat-hf)
 - [meta-llama/Llama-2-7b-chat-hf](https://huggingface.co/meta-llama/Llama-2-7b-chat-hf)
+- [ziqingyang/chinese-alpaca-2-7b](https://huggingface.co/ziqingyang/chinese-alpaca-2-7b)
+
+mistral:
+- [mistralai/Mistral-7B-v0.1](https://huggingface.co/mistralai/Mistral-7B-v0.1)
+- [HuggingFaceH4/zephyr-7b-beta](https://huggingface.co/HuggingFaceH4/zephyr-7b-beta)
 
 chatglm:
 - [THUDM/chatglm-6b](https://huggingface.co/THUDM/chatglm-6b)
 - [THUDM/chatglm2-6b](https://huggingface.co/THUDM/chatglm2-6b)
+- [THUDM/chatglm3-6b](https://huggingface.co/THUDM/chatglm3-6b)
 
 baichuan:
 - [baichuan-inc/baichuan-7B](https://huggingface.co/baichuan-inc/baichuan-7B)
 - [baichuan-inc/Baichuan-13B-Base](https://huggingface.co/baichuan-inc/Baichuan-13B-Base)
 - [baichuan-inc/Baichuan-13B-Chat](https://huggingface.co/baichuan-inc/Baichuan-13B-Chat)
+
+xverse:
+- [xverse/XVERSE-13B-Chat](https://huggingface.co/xverse/XVERSE-13B-Chat)
+
+qwen:
+- [Qwen/Qwen-7B-Chat](https://huggingface.co/Qwen/Qwen-7B-Chat)
+
+yi:
+- [01-ai/Yi-6B-200K](https://huggingface.co/01-ai/Yi-6B-200K)
+- [01-ai/Yi-6B-Chat](https://huggingface.co/01-ai/Yi-6B-Chat)
+- [01-ai/Yi-34B](https://huggingface.co/01-ai/Yi-34B)
 
 ## 💻 Inference 
 训练完成后，现在我们加载训练好的模型，验证模型生成文本的效果。
@@ -159,13 +224,19 @@ CUDA_VISIBLE_DEVICES=0 python inference.py \
 - `--tokenizer_path {base_model}`：存放HF格式的LLaMA模型权重和配置文件的目录
 - `--lora_model {lora_model}`：LoRA解压后文件所在目录，也可使用HF Model Hub模型调用名称。如果已经合并了LoRA权重到预训练模型，则可以不提供此参数
 - `--tokenizer_path {tokenizer_path}`：存放对应tokenizer的目录。若不提供此参数，则其默认值与--base_model相同
-- `--template_name`：模板名称，如`vicuna`、`alpaca`等。若不提供此参数，则其默认值是alpaca
+- `--template_name`：模板名称，如`vicuna`、`alpaca`等。若不提供此参数，则其默认值是vicuna
 - `--interactive`：以交互方式启动多轮问答，使用流式推理
-- `--data_file {file_name}`：非交互方式启动下，按行读取file_name中的的内容进行预测
-- `--predictions_file {file_name}`：非交互式方式下，将预测的结果以json格式写入file_name
+- `--data_file {file_name}`：非交互方式启动下，读取file_name中的的内容进行batch预测
+- `--output_file {file_name}`：非交互式方式下，将预测的结果以jsonl格式写入file_name
 - `--resize_emb`：是否调整embedding大小，若不调整，则使用预训练模型的embedding大小，默认不调整
 - `--only_cpu`：仅使用CPU进行推理
 - `--gpus {gpu_ids}`：指定使用的GPU设备编号，默认为0。如使用多张GPU，以逗号分隔，如0,1,2
+
+#### 多卡推理
+多卡数据并行，batch推理
+```shell
+CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node 2 inference_multigpu_demo.py --model_type baichuan --base_model shibing624/vicuna-baichuan-13b-chat
+```
 
 
 #### Inference Examples
@@ -191,11 +262,12 @@ CUDA_VISIBLE_DEVICES=0 python inference.py \
 
 </details>
 
+
 ## 📚 Dataset 
 ### 医疗数据集
 
 - 240万条中文医疗数据集(包括预训练、指令微调和奖励数据集)：[shibing624/medical](https://huggingface.co/datasets/shibing624/medical)
-- 22万条中文医疗对话数据集(华佗项目)：[FreedomIntelligence/HuatuoGPT-sft-data-v1](https://huggingface.co/datasets/FreedomIntelligence/HuatuoGPT-sft-data-v1)
+- 22万条中文医疗对话数据集(华佗项目)：[shibing624/huatuo_medical_qa_sharegpt](https://huggingface.co/datasets/shibing624/huatuo_medical_qa_sharegpt) [本项目支持格式]
 
 ### 通用数据集
 
@@ -217,7 +289,7 @@ CUDA_VISIBLE_DEVICES=0 python inference.py \
 
 #### Reward Model datasets
 - 原版的oasst1数据集：[OpenAssistant/oasst1](https://huggingface.co/datasets/OpenAssistant/oasst1)
-- 2万条多语言oasst1的reward数据集：[tasksource/oasst1_pairwise_rlhf_reward](https://huggingface.co/datasets/tasksource/oasst1_pairwise_rlhf_reward)
+- 2万条多语言oasst1的reward数据集：[tasksource/oasst1_pairwise_rlhf_reward](https://huggingface.co/datasets/tasksource/oasst1_pairwise_rlhf_reward)[本项目支持格式]
 - 11万条英文hh-rlhf的reward数据集：[Dahoas/full-hh-rlhf](https://huggingface.co/datasets/Dahoas/full-hh-rlhf)
 - 9万条英文reward数据集(来自Anthropic's Helpful Harmless dataset)：[Dahoas/static-hh](https://huggingface.co/datasets/Dahoas/static-hh)
 - 7万条英文reward数据集（来源同上）：[Dahoas/rm-static](https://huggingface.co/datasets/Dahoas/rm-static)
@@ -225,39 +297,23 @@ CUDA_VISIBLE_DEVICES=0 python inference.py \
 - 7万条英文Reward数据集：[yitingxie/rlhf-reward-datasets](https://huggingface.co/datasets/yitingxie/rlhf-reward-datasets)
 - 3千条中文知乎问答偏好数据集：[liyucheng/zhihu_rlhf_3k](https://huggingface.co/datasets/liyucheng/zhihu_rlhf_3k)
 
-## ✅ Todo
-
-1. [x] add multi-round dialogue data fine-tuning method
-2. [x] add reward model fine-tuning
-3. [x] add rl fine-tuning
-4. [x] add medical reward dataset
-5. [x] add llama in8/int4 training
-6. [x] add all training and predict demo in colab
 
 ## ☎️ Contact
 
 - Issue(建议)
   ：[![GitHub issues](https://img.shields.io/github/issues/shibing624/MedicalGPT.svg)](https://github.com/shibing624/MedicalGPT/issues)
 - 邮件我：xuming: xuming624@qq.com
-- 微信我： 加我*微信号：xuming624, 备注：姓名-公司名-NLP* 进NLP交流群。
+- 微信我： 加我*微信号：xuming624, 备注：姓名-公司名-NLP* 进NLP交流群（加我拉你进群）。
 
 <img src="https://github.com/shibing624/MedicalGPT/blob/main/docs/wechat.jpeg" width="200" />
 
-## ⚠️ 局限性、使用限制与免责声明
+<img src="https://github.com/shibing624/MedicalGPT/blob/main/docs/wechat_group.png" width="200" />
 
-基于当前数据和基础模型训练得到的SFT模型，在效果上仍存在以下问题：
-
-1. 在涉及事实性的指令上可能会产生违背事实的错误回答。
-
-2. 对于具备危害性的指令无法很好的鉴别，由此会产生危害性言论。
-
-3. 在一些涉及推理、代码、多轮对话等场景下模型的能力仍有待提高。
-
-基于以上模型局限性，我们要求开发者仅将我们开源的模型权重及后续用此项目生成的衍生物用于研究目的，不得用于商业，以及其他会对社会带来危害的用途。
+## ⚠️ LICENSE
 
 本项目仅可应用于研究目的，项目开发者不承担任何因使用本项目（包含但不限于数据、模型、代码等）导致的危害或损失。详细请参考[免责声明](https://github.com/shibing624/MedicalGPT/blob/main/DISCLAIMER)。
 
-项目代码的授权协议为 [The Apache License 2.0](/LICENSE)，代码可免费用做商业用途，模型权重和数据只能用于研究目的。请在产品说明中附加MedicalGPT的链接和授权协议。
+Medical项目代码的授权协议为 [The Apache License 2.0](/LICENSE)，代码可免费用做商业用途，模型权重和数据只能用于研究目的。请在产品说明中附加MedicalGPT的链接和授权协议。
 
 
 ## 😇 Citation
@@ -284,7 +340,15 @@ CUDA_VISIBLE_DEVICES=0 python inference.py \
 
 ## 💕 Acknowledgements 
 
+- [Direct Preference Optimization:Your Language Model is Secretly a Reward Model](https://arxiv.org/pdf/2305.18290.pdf)
 - [tloen/alpaca-lora](https://github.com/tloen/alpaca-lora/blob/main/finetune.py)
 - [ymcui/Chinese-LLaMA-Alpaca](https://github.com/ymcui/Chinese-LLaMA-Alpaca)
+- [hiyouga/LLaMA-Factory](https://github.com/hiyouga/LLaMA-Factory)
+- [dvlab-research/LongLoRA](https://github.com/dvlab-research/LongLoRA)
 
 Thanks for their great work!
+
+#### 关联项目推荐
+- [shibing624/ChatPDF](https://github.com/shibing624/ChatPDF)：基于本地 LLM 做检索知识问答（RAG）
+- [shibing624/chatgpt-webui](https://github.com/shibing624/chatgpt-webui)：给 LLM 对话和检索知识问答（RAG）提供一个简单好用的Web UI界面
+
