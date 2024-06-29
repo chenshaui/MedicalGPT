@@ -10,20 +10,23 @@ import json
 import time
 from argparse import ArgumentParser
 from contextlib import asynccontextmanager
-from pprint import pprint
-from typing import Dict, List, Literal, Optional, Union
+from threading import Thread
+from typing import Dict, List, Literal, Optional, Union, Any
 
 import torch
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from loguru import logger
 from pydantic import BaseModel, Field
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from transformers.generation import GenerationConfig
+from transformers import GenerationConfig, TextIteratorStreamer
+
+from template import get_conv_template
 
 
 class BasicAuthMiddleware(BaseHTTPMiddleware):
@@ -92,9 +95,9 @@ class ModelList(BaseModel):
 
 
 class ChatMessage(BaseModel):
-    role: Literal['user', 'assistant', 'system', 'function']
-    content: Optional[str]
-    function_call: Optional[Dict] = None
+    role: Literal['user', 'assistant', 'system', 'function', 'tool']
+    content: Optional[str] = None
+    tool_calls: Optional[Dict] = None
 
 
 class DeltaMessage(BaseModel):
@@ -105,7 +108,7 @@ class DeltaMessage(BaseModel):
 class ChatCompletionRequest(BaseModel):
     model: str
     messages: List[ChatMessage]
-    functions: Optional[List[Dict]] = None
+    tools: Optional[List[Dict]] = None
     temperature: Optional[float] = None
     top_p: Optional[float] = None
     top_k: Optional[int] = None
@@ -117,21 +120,36 @@ class ChatCompletionRequest(BaseModel):
 class ChatCompletionResponseChoice(BaseModel):
     index: int
     message: Union[ChatMessage]
-    finish_reason: Literal['stop', 'length', 'function_call']
+    finish_reason: Literal['stop', 'length', 'tool_calls']
 
 
 class ChatCompletionResponseStreamChoice(BaseModel):
     index: int
     delta: DeltaMessage
-    finish_reason: Optional[Literal['stop', 'length']]
+    finish_reason: Optional[Literal['stop', 'length']] = None
+
+
+class ChatCompletionResponseUsage(BaseModel):
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
 
 
 class ChatCompletionResponse(BaseModel):
+    id: Literal["chatcmpl-default"] = "chatcmpl-default"
+    object: Literal["chat.completion"] = "chat.completion"
+    created: int = Field(default_factory=lambda: int(time.time()))
     model: str
-    object: Literal['chat.completion', 'chat.completion.chunk']
-    choices: List[Union[ChatCompletionResponseChoice,
-    ChatCompletionResponseStreamChoice]]
-    created: Optional[int] = Field(default_factory=lambda: int(time.time()))
+    choices: List[ChatCompletionResponseChoice]
+    usage: ChatCompletionResponseUsage
+
+
+class ChatCompletionStreamResponse(BaseModel):
+    id: Literal["chatcmpl-default"] = "chatcmpl-default"
+    object: Literal["chat.completion.chunk"] = "chat.completion.chunk"
+    created: int = Field(default_factory=lambda: int(time.time()))
+    model: str
+    choices: List[ChatCompletionResponseStreamChoice]
 
 
 @app.get('/v1/models', response_model=ModelList)
@@ -143,15 +161,14 @@ async def list_models():
 
 # To work around that unpleasant leading-\n tokenization issue!
 def add_extra_stop_words(stop_words):
+    _stop_words = []
     if stop_words:
-        _stop_words = []
         _stop_words.extend(stop_words)
         for x in stop_words:
             s = x.lstrip('\n')
             if s and (s not in _stop_words):
                 _stop_words.append(s)
-        return _stop_words
-    return stop_words
+    return _stop_words
 
 
 def trim_stop_words(response, stop_words):
@@ -188,7 +205,7 @@ Begin!"""
 _TEXT_COMPLETION_CMD = object()
 
 
-def parse_messages(messages, functions):
+def parse_messages(messages, tools):
     if all(m.role != 'user' for m in messages):
         raise HTTPException(
             status_code=400,
@@ -199,17 +216,18 @@ def parse_messages(messages, functions):
     if messages[0].role == 'system':
         system = messages.pop(0).content.lstrip('\n').rstrip()
     else:
-        system = 'You are a helpful assistant.'
+        system = ''
 
-    if functions:
+    if tools:
         tools_text = []
         tools_name_text = []
-        for func_info in functions:
-            name = func_info.get('name', '')
-            name_m = func_info.get('name_for_model', name)
-            name_h = func_info.get('name_for_human', name)
-            desc = func_info.get('description', '')
-            desc_m = func_info.get('description_for_model', desc)
+        for tool_info in tools:
+            name = tool_info.get('name', '')
+            name_m = tool_info.get('name_for_model', name)
+            name_h = tool_info.get('name_for_human', name)
+            desc = tool_info.get('description', '')
+            desc_m = tool_info.get('description_for_model', desc)
+            params = tool_info.get('parameters', {})
             tool = TOOL_DESC.format(
                 name_for_model=name_m,
                 name_for_human=name_h,
@@ -217,8 +235,7 @@ def parse_messages(messages, functions):
                 #   "Format the arguments as a JSON object."
                 #   "Enclose the code within triple backticks (`) at the beginning and end of the code."
                 description_for_model=desc_m,
-                parameters=json.dumps(func_info['parameters'],
-                                      ensure_ascii=False),
+                parameters=json.dumps(params, ensure_ascii=False),
             )
             tools_text.append(tool)
             tools_name_text.append(name_m)
@@ -234,7 +251,7 @@ def parse_messages(messages, functions):
     messages_with_fncall = messages
     messages = []
     for m_idx, m in enumerate(messages_with_fncall):
-        role, content, func_call = m.role, m.content, m.function_call
+        role, content, tool_calls = m.role, m.content, m.tool_calls
         content = content or ''
         content = content.lstrip('\n').rstrip()
         if role == 'function':
@@ -254,11 +271,11 @@ def parse_messages(messages, functions):
                     detail=
                     'Invalid request: Expecting role user before role assistant.',
                 )
-            if func_call is None:
-                if functions:
+            if tool_calls is None:
+                if tools:
                     content = f'Thought: I now know the final answer.\nFinal Answer: {content}'
             else:
-                f_name, f_args = func_call['name'], func_call['arguments']
+                f_name, f_args = tool_calls['name'], tool_calls['arguments']
                 if not content.startswith('Thought:'):
                     content = f'Thought: {content}'
                 content = f'{content}\nAction: {f_name}\nAction Input: {f_args}'
@@ -330,12 +347,12 @@ def parse_response(response):
             message=ChatMessage(
                 role='assistant',
                 content=response,
-                function_call={
+                tool_calls={
                     'name': func_name,
                     'arguments': func_args
                 },
             ),
-            finish_reason='function_call',
+            finish_reason='tool_calls',
         )
         return choice_data
 
@@ -350,38 +367,59 @@ def parse_response(response):
     return choice_data
 
 
-# completion mode, not chat mode
-def text_complete_last_message(history, stop_words_ids, gen_kwargs, system):
-    im_start = '<|im_start|>'
-    im_end = '<|im_end|>'
-    prompt = f'{im_start}system\n{system}{im_end}'
-    for i, (query, response) in enumerate(history):
-        query = query.lstrip('\n').rstrip()
-        response = response.lstrip('\n').rstrip()
-        prompt += f'\n{im_start}user\n{query}{im_end}'
-        prompt += f'\n{im_start}assistant\n{response}{im_end}'
-    prompt = prompt[:-len(im_end)]
+def prepare_chat(tokenizer, query, history, system):
+    """Prepare model inputs for chat completion."""
+    if prompt_template:
+        history_messages = history + [[query, ""]]
+        prompt = prompt_template.get_prompt(messages=history_messages, system_prompt=system)
+    else:
+        messages = [
+            {"role": "system", "content": system}
+        ]
+        for i, (question, response) in enumerate(history):
+            question = question.lstrip('\n').rstrip()
+            response = response.lstrip('\n').rstrip()
+            messages.append({"role": "user", "content": question})
+            messages.append({"role": "assistant", "content": response})
+        messages.append({"role": "user", "content": query})
+        prompt = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True
+        )
+    model_inputs = tokenizer([prompt], return_tensors='pt')
+    return model_inputs
 
-    _stop_words_ids = [tokenizer.encode(im_end)]
-    if stop_words_ids:
-        for s in stop_words_ids:
-            _stop_words_ids.append(s)
-    stop_words_ids = _stop_words_ids
 
-    input_ids = torch.tensor([tokenizer.encode(prompt)]).to(model.device)
-    output = model.generate(input_ids,
-                            stop_words_ids=stop_words_ids,
-                            **gen_kwargs).tolist()[0]
-    output = tokenizer.decode(output, errors='ignore')
-    assert output.startswith(prompt)
-    output = output[len(prompt):]
-    output = trim_stop_words(output, ['<|endoftext|>', im_end])
-    print(f'<completion>\n{prompt}\n<!-- *** -->\n{output}\n</completion>')
-    return output
+def model_chat(model, tokenizer, query, history, gen_kwargs, system):
+    """Generate chat completion from the model."""
+    model_inputs = prepare_chat(tokenizer, query, history, system).to(model.device)
+    generated_ids = model.generate(model_inputs.input_ids, **gen_kwargs)
+    generated_ids = [
+        output_ids[len(input_ids):] for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
+    ]
+    response = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
+    prompt_length = len(model_inputs.input_ids[0])
+    response_length = len(generated_ids[0])
+    return response, prompt_length, response_length
+
+
+def stream_model_chat(model, tokenizer, query, history, gen_kwargs, system):
+    """Generate chat completion from the model in stream mode."""
+    model_inputs = prepare_chat(tokenizer, query, history, system).to(model.device)
+    gen_kwargs['inputs'] = model_inputs.input_ids
+
+    streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
+    gen_kwargs['streamer'] = streamer
+    thread = Thread(target=model.generate, kwargs=gen_kwargs, daemon=True)
+    thread.start()
+
+    yield from streamer
 
 
 @app.post('/v1/chat/completions', response_model=ChatCompletionResponse)
 async def create_chat_completion(request: ChatCompletionRequest):
+    """Generate chat completion."""
     global model, tokenizer
 
     gen_kwargs = {}
@@ -395,54 +433,47 @@ async def create_chat_completion(request: ChatCompletionRequest):
             gen_kwargs['temperature'] = request.temperature
     if request.top_p is not None:
         gen_kwargs['top_p'] = request.top_p
+    if request.max_length is not None:
+        gen_kwargs['max_length'] = request.max_length
 
     stop_words = add_extra_stop_words(request.stop)
-    if request.functions:
+    if request.tools:
         stop_words = stop_words or []
         if 'Observation:' not in stop_words:
             stop_words.append('Observation:')
 
-    query, history, system = parse_messages(request.messages, request.functions)
+    query, history, system = parse_messages(request.messages, request.tools)
 
     if request.stream:
-        if request.functions:
+        if request.tools:
             raise HTTPException(
                 status_code=400,
                 detail='Invalid request: Function calling is not yet implemented for stream mode.',
             )
-        generate = predict(query,
-                           history,
-                           request.model,
-                           stop_words,
-                           gen_kwargs,
-                           system=system)
-        return StreamingResponse(generate, media_type='text/event-stream')
-
-    stop_words_ids = [tokenizer.encode(s)
-                      for s in stop_words] if stop_words else None
-    if query is _TEXT_COMPLETION_CMD:
-        response = text_complete_last_message(
+        generate = stream_chat_completion(
+            query,
             history,
-            stop_words_ids=stop_words_ids,
-            gen_kwargs=gen_kwargs,
+            request.model,
+            stop_words,
+            gen_kwargs,
             system=system
         )
-    else:
-        response, _ = model.chat(
-            tokenizer,
-            query,
-            history=history,
-            system=system,
-            stop_words_ids=stop_words_ids,
-            **gen_kwargs,
-        )
-        print('<chat>')
-        pprint(history, indent=2)
-        print(f'{query}\n<!-- *** -->\n{response}\n</chat>')
+        return StreamingResponse(generate, media_type='text/event-stream')
+
+    response, prompt_length, response_length = model_chat(
+        model,
+        tokenizer,
+        query,
+        history,
+        gen_kwargs=gen_kwargs,
+        system=system
+    )
+    logger.debug(f'*** history begin ***\n{history}\n*** history end ***\n'
+                 f'question: {query}\nresponse: {response}\n')
     _gc()
 
     response = trim_stop_words(response, stop_words)
-    if request.functions:
+    if request.tools:
         choice_data = parse_response(response)
     else:
         choice_data = ChatCompletionResponseChoice(
@@ -450,19 +481,30 @@ async def create_chat_completion(request: ChatCompletionRequest):
             message=ChatMessage(role='assistant', content=response),
             finish_reason='stop',
         )
-    return ChatCompletionResponse(model=request.model,
-                                  choices=[choice_data],
-                                  object='chat.completion')
+
+    usage = ChatCompletionResponseUsage(
+        prompt_tokens=prompt_length,
+        completion_tokens=response_length,
+        total_tokens=prompt_length + response_length,
+    )
+    return ChatCompletionResponse(model=request.model, choices=[choice_data], usage=usage)
 
 
-def _dump_json(data: BaseModel, *args, **kwargs) -> str:
-    try:
-        return data.model_dump_json(*args, **kwargs)
-    except AttributeError:  # pydantic<2.0.0
-        return data.json(*args, **kwargs)  # noqa
+def dictify(data: BaseModel) -> Dict[str, Any]:
+    try:  # pydantic v2
+        return data.model_dump(exclude_unset=True)
+    except AttributeError:  # pydantic v1
+        return data.dict(exclude_unset=True)
 
 
-async def predict(
+def jsonify(data: BaseModel) -> str:
+    try:  # pydantic v2
+        return json.dumps(data.model_dump(exclude_unset=True), ensure_ascii=False)
+    except AttributeError:  # pydantic v1
+        return data.json(exclude_unset=True, ensure_ascii=False)
+
+
+async def stream_chat_completion(
         query: str,
         history: List[List[str]],
         model_id: str,
@@ -470,113 +512,60 @@ async def predict(
         gen_kwargs: Dict,
         system: str,
 ):
+    """Generate chat completion in stream mode."""
     global model, tokenizer
     choice_data = ChatCompletionResponseStreamChoice(
-        index=0, delta=DeltaMessage(role='assistant'), finish_reason=None)
-    chunk = ChatCompletionResponse(model=model_id,
-                                   choices=[choice_data],
-                                   object='chat.completion.chunk')
-    yield '{}'.format(_dump_json(chunk, exclude_unset=True))
+        index=0, delta=DeltaMessage(role='assistant', content=""), finish_reason=None)
+    chunk = ChatCompletionStreamResponse(model=model_id, choices=[choice_data])
+    yield jsonify(chunk)
 
-    current_length = 0
-    stop_words_ids = [tokenizer.encode(s)
-                      for s in stop_words] if stop_words else None
-
-    delay_token_num = max([len(x) for x in stop_words])
-    response_generator = model.chat_stream(
+    stop_words = [x for x in stop_words if x]
+    response_generator = stream_model_chat(
+        model,
         tokenizer,
         query,
-        history=history,
-        stop_words_ids=stop_words_ids,
-        system=system,
-        **gen_kwargs
+        history,
+        gen_kwargs,
+        system
     )
-    _new_response = ''
-    for _new_response in response_generator:
-        if len(_new_response) <= delay_token_num:
-            continue
-        new_response = _new_response[:-delay_token_num]
+    for token_output in response_generator:
+        # Check if any stop word is in the token output
+        if any(stop_word in token_output for stop_word in stop_words):
+            break
 
-        if len(new_response) == current_length:
-            continue
-
-        new_text = new_response[current_length:]
-        current_length = len(new_response)
-
+        # Send the current token as part of the response
         choice_data = ChatCompletionResponseStreamChoice(
-            index=0, delta=DeltaMessage(content=new_text), finish_reason=None)
-        chunk = ChatCompletionResponse(model=model_id,
-                                       choices=[choice_data],
-                                       object='chat.completion.chunk')
-        yield '{}'.format(_dump_json(chunk, exclude_unset=True))
+            index=0, delta=DeltaMessage(content=token_output), finish_reason=None)
+        chunk = ChatCompletionStreamResponse(model=model_id, choices=[choice_data])
+        yield jsonify(chunk)
 
-    if current_length != len(_new_response):
-        # Determine whether to print the delay tokens
-        delayed_text = _new_response[current_length:]
-        new_text = trim_stop_words(delayed_text, stop_words)
-        if len(new_text) > 0:
-            choice_data = ChatCompletionResponseStreamChoice(
-                index=0, delta=DeltaMessage(content=new_text), finish_reason=None)
-            chunk = ChatCompletionResponse(model=model_id,
-                                           choices=[choice_data],
-                                           object='chat.completion.chunk')
-            yield '{}'.format(_dump_json(chunk, exclude_unset=True))
-
-    choice_data = ChatCompletionResponseStreamChoice(index=0,
-                                                     delta=DeltaMessage(),
-                                                     finish_reason='stop')
-    chunk = ChatCompletionResponse(model=model_id,
-                                   choices=[choice_data],
-                                   object='chat.completion.chunk')
-    yield '{}'.format(_dump_json(chunk, exclude_unset=True))
+    choice_data = ChatCompletionResponseStreamChoice(
+        index=0, delta=DeltaMessage(), finish_reason='stop'
+    )
+    chunk = ChatCompletionStreamResponse(model=model_id, choices=[choice_data])
+    yield jsonify(chunk)
     yield '[DONE]'
 
     _gc()
 
 
-def _get_args():
+if __name__ == '__main__':
     parser = ArgumentParser()
-    parser.add_argument(
-        '-c',
-        '--checkpoint-path',
-        type=str,
-        default='Qwen/Qwen-7B-Chat',
-        help='Checkpoint name or path, default to %(default)r',
-    )
-    parser.add_argument('--api-auth', help='API authentication credentials')
-    parser.add_argument('--cpu-only',
-                        action='store_true',
-                        help='Run demo with CPU only')
-    parser.add_argument('--server-port',
-                        type=int,
-                        default=8000,
-                        help='Demo server port.')
-    parser.add_argument(
-        '--server-name',
-        type=str,
-        default='127.0.0.1',
-        help=
-        'Demo server name. Default: 127.0.0.1, which is only visible from the local computer.'
-        ' If you want other computers to access your server, use 0.0.0.0 instead.',
-    )
-    parser.add_argument(
-        '--disable-gc',
-        action='store_true',
-        help='Disable GC after each response generated.',
-    )
+    parser.add_argument('--base_model', type=str, default='Qwen/Qwen-7B-Chat', help='Model name or path')
+    parser.add_argument('--lora_model', default=None, type=str, help="If None, perform inference on the base model")
+    parser.add_argument('--template_name', default=None, type=str,
+                        help="Prompt template name, eg: alpaca, vicuna, baichuan, chatglm2 etc.")
+    parser.add_argument('--api_auth', help='API authentication credentials')
+    parser.add_argument('--cpu_only', action='store_true', help='Run demo with CPU only')
+    parser.add_argument('--server_port', type=int, default=8000, help='Demo server port.')
+    parser.add_argument('--server_name', type=str, default='127.0.0.1',
+                        help=('Demo server name. Default: 127.0.0.1, which is only visible from the local computer. '
+                              'If you want other computers to access your server, use 0.0.0.0 instead.')
+                        )
+    parser.add_argument('--disable_gc', action='store_true', help='Disable GC after each response generated.')
 
     args = parser.parse_args()
-    return args
-
-
-if __name__ == '__main__':
-    args = _get_args()
-
-    tokenizer = AutoTokenizer.from_pretrained(
-        args.checkpoint_path,
-        trust_remote_code=True,
-        resume_download=True,
-    )
+    logger.info(args)
 
     if args.api_auth:
         app.add_middleware(
@@ -585,22 +574,37 @@ if __name__ == '__main__':
             password=args.api_auth.split(':')[1]
         )
 
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.base_model,
+        trust_remote_code=True,
+        resume_download=True,
+    )
+
     if args.cpu_only:
         device_map = 'cpu'
     else:
         device_map = 'auto'
-
     model = AutoModelForCausalLM.from_pretrained(
-        args.checkpoint_path,
+        args.base_model,
         device_map=device_map,
         trust_remote_code=True,
         resume_download=True,
-    ).eval()
+    )
+    if args.lora_model:
+        from peft import PeftModel
 
+        model = PeftModel.from_pretrained(model, args.lora_model, device_map=device_map)
+        logger.debug(f'Loaded LORA model: {args.lora_model}')
+
+    model = model.eval()
     model.generation_config = GenerationConfig.from_pretrained(
-        args.checkpoint_path,
+        args.base_model,
         trust_remote_code=True,
         resume_download=True,
     )
+    if args.template_name:
+        prompt_template = get_conv_template(args.template_name)
+    else:
+        prompt_template = None
 
     uvicorn.run(app, host=args.server_name, port=args.server_port, workers=1)

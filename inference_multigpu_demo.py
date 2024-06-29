@@ -23,17 +23,17 @@ from transformers import (
     AutoTokenizer,
     BloomForCausalLM,
     BloomTokenizerFast,
-    LlamaTokenizer,
     LlamaForCausalLM,
     GenerationConfig,
+    BitsAndBytesConfig,
 )
 
-from supervised_finetuning import get_conv_template
+from template import get_conv_template
 
 MODEL_CLASSES = {
     "bloom": (BloomForCausalLM, BloomTokenizerFast),
     "chatglm": (AutoModel, AutoTokenizer),
-    "llama": (LlamaForCausalLM, LlamaTokenizer),
+    "llama": (LlamaForCausalLM, AutoTokenizer),
     "baichuan": (AutoModelForCausalLM, AutoTokenizer),
     "auto": (AutoModelForCausalLM, AutoTokenizer),
 }
@@ -58,8 +58,9 @@ def main():
     parser.add_argument('--tokenizer_path', default=None, type=str)
     parser.add_argument('--template_name', default="vicuna", type=str,
                         help="Prompt template name, eg: alpaca, vicuna, baichuan, chatglm2 etc.")
+    parser.add_argument('--system_prompt', default="", type=str)
     parser.add_argument("--repetition_penalty", type=float, default=1.0)
-    parser.add_argument('--do_sample', action='store_true', help='Whether to use sampling in generation')
+    parser.add_argument('--temperature', type=float, default=0.7)
     parser.add_argument("--max_new_tokens", type=int, default=128)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument('--data_file', default=None, type=str, help="Predict file, one example per line")
@@ -83,7 +84,7 @@ def main():
 
     model_class, tokenizer_class = MODEL_CLASSES[args.model_type]
     tokenizer = tokenizer_class.from_pretrained(args.tokenizer_path, trust_remote_code=True, padding_side='left')
-    load_type = torch.float16
+    load_type = 'auto'
     base_model = model_class.from_pretrained(
         args.base_model,
         load_in_8bit=args.load_in_8bit,
@@ -92,6 +93,11 @@ def main():
         low_cpu_mem_usage=True,
         device_map={"": local_rank},
         trust_remote_code=True,
+        quantization_config=BitsAndBytesConfig(
+            load_in_4bit=args.load_in_4bit,
+            load_in_8bit=args.load_in_8bit,
+            bnb_4bit_compute_dtype=load_type,
+        ) if args.load_in_8bit or args.load_in_4bit else None,
     )
     try:
         base_model.generation_config = GenerationConfig.from_pretrained(args.base_model, trust_remote_code=True)
@@ -137,7 +143,8 @@ def main():
     write_batch_size = args.batch_size * world_size * 10
     generation_kwargs = dict(
         max_new_tokens=args.max_new_tokens,
-        do_sample=args.do_sample,
+        temperature=args.temperature,
+        do_sample=True if args.temperature > 0.0 else False,
         repetition_penalty=args.repetition_penalty,
     )
     stop_str = tokenizer.eos_token if tokenizer.eos_token else prompt_template.stop_str
@@ -159,7 +166,8 @@ def main():
         inputs = []
         for texts in data_loader:
             inputs.extend(texts)
-            prompted_texts = [prompt_template.get_prompt(messages=[[s, '']]) for s in texts]
+            messages = [[s, ''] for s in texts]
+            prompted_texts = [prompt_template.get_prompt(messages=messages, system_prompt=args.system_prompt)]
             logger.debug(f'local_rank: {local_rank}, inputs size:{len(prompted_texts)}, top3: {prompted_texts[:3]}')
             inputs_tokens = tokenizer(prompted_texts, return_tensors="pt", padding=True)
             input_ids = inputs_tokens['input_ids'].to(local_rank)

@@ -1,10 +1,9 @@
 # -*- coding: utf-8 -*-
 """
 @author:XuMing(xuming624@qq.com)
-@description: Train a model from SFT using DPO
+@description: Train a model from base model using ORPO
 """
 import os
-from copy import deepcopy
 from dataclasses import dataclass, field
 from glob import glob
 from typing import Dict, Optional
@@ -22,11 +21,10 @@ from transformers import (
     BloomTokenizerFast,
     AutoTokenizer,
     HfArgumentParser,
-    TrainingArguments,
     BitsAndBytesConfig,
 )
 from transformers.deepspeed import is_deepspeed_zero3_enabled
-from trl import DPOTrainer
+from trl import ORPOConfig, ORPOTrainer
 
 from template import get_conv_template
 
@@ -134,7 +132,7 @@ class ScriptArguments:
     # Training arguments
     use_peft: bool = field(default=True, metadata={"help": "Whether to use peft"})
     qlora: bool = field(default=False, metadata={"help": "Whether to use qlora"})
-    target_modules: Optional[str] = field(default=None)
+    target_modules: Optional[str] = field(default="all", metadata={"help": "The target modules for peft"})
     lora_rank: Optional[int] = field(default=8)
     lora_dropout: Optional[float] = field(default=0.05)
     lora_alpha: Optional[float] = field(default=16.0)
@@ -166,6 +164,10 @@ class ScriptArguments:
         metadata={"help": "Remove unused columns from the dataset if `datasets.Dataset` is used"},
     )
     report_to: Optional[str] = field(default="tensorboard", metadata={"help": "Report to wandb or tensorboard"})
+    orpo_beta: float = field(
+        default=0.1,
+        metadata={"help": "The beta (lambda) parameter in ORPO loss representing the weight of the SFT loss."},
+    )
 
     def __post_init__(self):
         if self.model_type is None:
@@ -437,7 +439,9 @@ def main():
     else:
         model.config.use_cache = True
 
-    training_args = TrainingArguments(
+    training_args = ORPOConfig(
+        max_length=full_max_length,
+        max_prompt_length=args.max_source_length,
         per_device_train_batch_size=args.per_device_train_batch_size,
         per_device_eval_batch_size=args.per_device_eval_batch_size,
         max_steps=args.max_steps,
@@ -456,10 +460,11 @@ def main():
         bf16=args.bf16,
         fp16=args.fp16,
         remove_unused_columns=args.remove_unused_columns,
-        run_name=f"dpo_{args.model_type}",
+        run_name=f"orpo_{args.model_type}",
+        beta=args.orpo_beta,
     )
 
-    # Initialize DPO trainer
+    # Initialize ORPO trainer
     peft_config = None
     if args.use_peft:
         logger.info("Fine-tuning method: LoRA(PEFT)")
@@ -477,17 +482,13 @@ def main():
         )
     else:
         logger.info("Fine-tuning method: Full parameters training")
-    trainer = DPOTrainer(
+    trainer = ORPOTrainer(
         model,
-        ref_model=None if args.use_peft else deepcopy(model),
         args=training_args,
-        beta=args.beta,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         tokenizer=tokenizer,
         peft_config=peft_config if args.use_peft else None,
-        max_prompt_length=args.max_source_length,
-        max_length=full_max_length,
     )
     print_trainable_parameters(trainer.model)
 

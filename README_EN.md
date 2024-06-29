@@ -1,4 +1,4 @@
-[**🇨🇳中文**](https://github.com/shibing624/MedicalGPT/blob/main/README.md) | [**🌐English**](https://github.com/shibing624/MedicalGPT/blob/main/README_EN.md) | [**📖文档/Docs**](https://github.com/shibing624/MedicalGPT/wiki) | [**🤖模型/Models**](https://huggingface.co/shibing624) 
+[**🇨🇳中文**](https://github.com/shibing624/MedicalGPT/blob/main/README.md) | [**🌐English**](https://github.com/shibing624/MedicalGPT/blob/main/README_EN.md) | [**📖文档/Docs**](https://github.com/shibing624/MedicalGPT/wiki) | [**🤖模型/Models**](https://huggingface.co/shibing624)
 
 <div align="center">
   <a href="https://github.com/shibing624/MedicalGPT">
@@ -15,11 +15,11 @@
 [![License Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![python_version](https://img.shields.io/badge/Python-3.8%2B-green.svg)](requirements.txt)
 [![GitHub issues](https://img.shields.io/github/issues/shibing624/MedicalGPT.svg)](https://github.com/shibing624/MedicalGPT/issues)
-[![Wechat Group](http://vlog.sfyc.ltd/wechat_everyday/wxgroup_logo.png?imageView2/0/w/60/h/20)](#Contact)
+[![Wechat Group](https://img.shields.io/badge/wechat-group-green.svg?logo=wechat)](#Contact)
 
 ## 📖 Introduction
 
-**MedicalGPT** training medical GPT model with ChatGPT training pipeline, implemantation of Pretraining, 
+**MedicalGPT** training medical GPT model with ChatGPT training pipeline, implemantation of Pretraining,
 Supervised Finetuning, Reward Modeling and Reinforcement Learning.
 
 
@@ -38,7 +38,7 @@ Training MedicalGPT model：
 
 We provide a simple Gradio-based interactive web interface. After the service is started, it can be accessed through a browser, enter a question, and the model will return an answer. The command is as follows:
 ```shell
-python scripts/gradio_demo.py --base_model path_to_llama_hf_dir --lora_model path_to_lora_dir
+python gradio_demo.py --base_model path_to_llama_hf_dir --lora_model path_to_lora_dir
 ```
 
 Parameter Description:
@@ -117,16 +117,55 @@ sh run_ppo.sh
 [Training Detail wiki](https://github.com/shibing624/MedicalGPT/wiki/Training-Details)
 
 
-### Hardware Requirement
+#### Supported Models
 
-| Method | Bits |   7B  |  13B  |  30B  |   65B  |   8x7B |
-| ------ | ---- | ----- | ----- | ----- | ------ | ------ |
-| Full   |  16  | 160GB | 320GB | 600GB | 1200GB |  900GB |
-| LoRA   |  16  |  16GB |  32GB |  80GB |  160GB |  120GB |
-| QLoRA  |   8  |  10GB |  16GB |  40GB |   80GB |   80GB |
-| QLoRA  |   4  |   6GB |  12GB |  24GB |   48GB |   32GB |
 
-## 🔥 Inference 
+| Model Name                                                           | Model Size                  | Target Modules  | Template  |
+|----------------------------------------------------------------------|-----------------------------|-----------------|-----------|
+| [Baichuan](https://github.com/baichuan-inc/baichuan-13B)             | 7B/13B                      | W_pack          | baichuan  |
+| [Baichuan2](https://github.com/baichuan-inc/Baichuan2)               | 7B/13B                      | W_pack          | baichuan2 |
+| [BLOOMZ](https://huggingface.co/bigscience/bloomz)                   | 560M/1.1B/1.7B/3B/7.1B/176B | query_key_value | vicuna    |
+| [ChatGLM](https://github.com/THUDM/ChatGLM-6B)                       | 6B                          | query_key_value | chatglm   |
+| [ChatGLM2](https://github.com/THUDM/ChatGLM2-6B)                     | 6B                          | query_key_value | chatglm2  |
+| [ChatGLM3](https://github.com/THUDM/ChatGLM3)                        | 6B                          | query_key_value | chatglm3  |
+| [Cohere](https://huggingface.co/CohereForAI/c4ai-command-r-plus)     | 104B                        | q_proj,v_proj   | cohere    |
+| [DeepSeek](https://github.com/deepseek-ai/DeepSeek-LLM)              | 7B/16B/67B                  | q_proj,v_proj   | deepseek  |
+| [InternLM2](https://github.com/InternLM/InternLM)                    | 7B/20B                      | wqkv            | intern2    |
+| [LLaMA](https://github.com/facebookresearch/llama)                   | 7B/13B/33B/65B              | q_proj,v_proj   | alpaca    |
+| [LLaMA2](https://huggingface.co/meta-llama)                          | 7B/13B/70B                  | q_proj,v_proj   | llama2    |
+| [LLaMA3](https://huggingface.co/meta-llama)                          | 8B/70B                      | q_proj,v_proj   | llama3    |
+| [Mistral](https://huggingface.co/mistralai/Mistral-7B-Instruct-v0.1) | 7B/8x7B                     | q_proj,v_proj   | mistral   |
+| [Orion](https://github.com/OrionStarAI/Orion)                        | 14B                         | q_proj,v_proj   | orion     |
+| [Qwen](https://github.com/QwenLM/Qwen)                               | 1.8B/7B/14B/72B             | c_attn          | chatml    |
+| [Qwen1.5](https://github.com/QwenLM/Qwen1.5)                         | 0.5B/1.8B/4B/14B/72B        | q_proj,v_proj   | qwen      |
+| [XVERSE](https://github.com/xverse-ai/XVERSE-13B)                    | 13B                         | query_key_value | xverse    |
+| [Yi](https://github.com/01-ai/Yi)                                    | 6B/34B                      | q_proj,v_proj   | yi        |
+
+
+## 💾 Install
+#### Updating the requirements
+From time to time, the `requirements.txt` changes. To update, use this command:
+
+```markdown
+git clone https://github.com/shibing624/MedicalGPT
+cd MedicalGPT
+pip install -r requirements.txt --upgrade
+```
+
+### Hardware Requirement (VRAM)
+
+
+| Train Method  | Bits |   7B  |  13B  |  30B  |   70B  |  110B  |  8x7B |  8x22B |
+|-------|------| ----- | ----- | ----- | ------ | ------ | ----- | ------ |
+| Full   | AMP  | 120GB | 240GB | 600GB | 1200GB | 2000GB | 900GB | 2400GB |
+| Full   | 16   |  60GB | 120GB | 300GB |  600GB |  900GB | 400GB | 1200GB |
+| LoRA  | 16   |  16GB |  32GB |  64GB |  160GB |  240GB | 120GB |  320GB |
+| QLoRA | 8    |  10GB |  20GB |  40GB |   80GB |  140GB |  60GB |  160GB |
+| QLoRA | 4    |   6GB |  12GB |  24GB |   48GB |   72GB |  30GB |   96GB |
+| QLoRA | 2    |   4GB |   8GB |  16GB |   24GB |   48GB |  18GB |   48GB |
+
+
+## 🔥 Inference
 After the training is complete, now we load the trained model to verify the effect of the model generating text.
 
 ```shell
@@ -154,13 +193,13 @@ Parameter Description:
 
 <details>
 | Human | Assistant |
-| ----- | ------ |
+|-----|------|
 | How to make yourself energetic, list 5 suggestions | Here are some suggestions to keep you energetic: <br/>1. Get enough sleep. Make sure to get enough sleep every night. <br/>2. Exercise more. Doing moderate aerobic exercise, such as jogging and swimming, can help improve your energy and stamina. 3. Eat healthy food. Choose protein-rich foods such as chicken, fish, and eggs, as well as fresh fruits and vegetables. 4. Reduce caffeine intake. Try to avoid drinking caffeinated beverages or eating caffeinated foods during the day. <br/>5. Relax. Try meditation, yoga, or other forms of relaxation to reduce stress and anxiety. |
 </details>
 <br/>
 
 
-## 📚 Dataset 
+## 📚 Dataset
 
 - 2.4 million Chinese medical datasets (including pre-training, instruction fine-tuning and reward datasets): [shibing624/medical](https://huggingface.co/datasets/shibing624/medical)
 
@@ -208,9 +247,11 @@ The project code is still very rough. If you have improved the code, you are wel
 
 Then you can submit a PR.
 
-## 💕 Acknowledgements 
+## 💕 Acknowledgements
 
 - [tloen/alpaca-lora](https://github.com/tloen/alpaca-lora/blob/main/finetune.py)
 - [ymcui/Chinese-LLaMA-Alpaca](https://github.com/ymcui/Chinese-LLaMA-Alpaca)
 
 Thanks for their great work!
+#### Related Projects
+- [shibing624/ChatPilot](https://github.com/shibing624/ChatPilot): Provide a simple and easy-to-use web UI interface for LLM Agent (including RAG, online search, code interpreter).

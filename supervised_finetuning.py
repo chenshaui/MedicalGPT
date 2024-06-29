@@ -17,16 +17,16 @@ Fine-tuning the library models for causal language modeling (GPT, LLaMA, Bloom, 
 
 part of code is modified from https://github.com/shibing624/textgen
 """
+
 import math
 import os
 from dataclasses import dataclass, field
 from glob import glob
 from types import MethodType
-from typing import Literal, Optional, Tuple, List, Dict, Sequence
+from typing import Literal, Optional, Tuple
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from datasets import load_dataset
 from loguru import logger
 from peft import LoraConfig, TaskType, get_peft_model, PeftModel, prepare_model_for_kbit_training
@@ -35,7 +35,6 @@ from transformers import (
     BloomForCausalLM,
     AutoModel,
     AutoModelForCausalLM,
-    LlamaTokenizer,
     LlamaForCausalLM,
     BloomTokenizerFast,
     AutoTokenizer,
@@ -53,7 +52,6 @@ from transformers.models.llama.modeling_llama import (
     LlamaFlashAttention2,
     Cache
 )
-from transformers.models.mixtral.modeling_mixtral import MixtralBLockSparseTop2MLP, MixtralSparseMoeBlock
 from transformers.trainer import TRAINING_ARGS_NAME
 from transformers.trainer_pt_utils import LabelSmoother
 from transformers.utils.versions import require_version
@@ -72,10 +70,12 @@ try:
 except ImportError:
     is_flash_attn_2_available = False
 
+from template import get_conv_template
+
 MODEL_CLASSES = {
     "bloom": (AutoConfig, BloomForCausalLM, BloomTokenizerFast),
     "chatglm": (AutoConfig, AutoModel, AutoTokenizer),
-    "llama": (AutoConfig, LlamaForCausalLM, LlamaTokenizer),
+    "llama": (AutoConfig, LlamaForCausalLM, AutoTokenizer),
     "baichuan": (AutoConfig, AutoModelForCausalLM, AutoTokenizer),
     "auto": (AutoConfig, AutoModelForCausalLM, AutoTokenizer),
 }
@@ -150,7 +150,7 @@ class ModelArguments:
     )
     shift_attn: Optional[bool] = field(
         default=False,
-        metadata={"help": "Enable shift short attention (S^2-Attn) proposed by LongLoRA."}
+        metadata={"help": "Enable shifted sparse attention (S^2-Attn) proposed by LongLoRA."}
     )
     neft_alpha: Optional[float] = field(
         default=0,
@@ -180,7 +180,6 @@ class DataArguments:
     )
     train_file_dir: Optional[str] = field(default=None, metadata={"help": "The train jsonl data file folder."})
     validation_file_dir: Optional[str] = field(default=None, metadata={"help": "The evaluation jsonl file folder."})
-    template_name: Optional[str] = field(default="vicuna", metadata={"help": "The prompt template name."})
     max_train_samples: Optional[int] = field(
         default=None,
         metadata={
@@ -237,455 +236,11 @@ class ScriptArguments:
         default=512,
         metadata={"help": "Maximum model context length. suggest: 8192 * 4, 8192 * 2, 8192, 4096, 2048, 1024, 512"}
     )
+    template_name: Optional[str] = field(default="vicuna", metadata={"help": "The prompt template name."})
 
     def __post_init__(self):
         if self.model_max_length < 60:
             raise ValueError("You must specify a valid model_max_length >= 60 to run training")
-
-
-@dataclass
-class Conversation:
-    """A class that manages prompt templates and keeps all conversation history."""
-
-    # The name of this template
-    name: str
-    # The system prompt
-    system_prompt: str
-    # All messages. format: list of [question, answer]
-    messages: Optional[List[Sequence[str]]]
-    # The roles of the speakers
-    roles: Optional[Sequence[str]]
-    # Conversation prompt
-    prompt: str
-    # Separator
-    sep: str
-    # Stop token, default is tokenizer.eos_token
-    stop_str: Optional[str] = "</s>"
-
-    def get_prompt(
-            self,
-            messages: Optional[List[Sequence[str]]] = None,
-            system_prompt: Optional[str] = ""
-    ) -> str:
-        """
-        Returns a string containing prompt without response.
-        """
-        return "".join(self._format_example(messages, system_prompt))
-
-    def get_dialog(
-            self,
-            messages: Optional[List[Sequence[str]]] = None,
-            system_prompt: Optional[str] = ""
-    ) -> List[str]:
-        """
-        Returns a list containing 2 * n elements where the 2k-th is a query and the (2k+1)-th is a response.
-        """
-        return self._format_example(messages, system_prompt)
-
-    def _format_example(
-            self,
-            messages: Optional[List[Sequence[str]]] = None,
-            system_prompt: Optional[str] = ""
-    ) -> List[str]:
-        system_prompt = system_prompt or self.system_prompt
-        system_prompt = system_prompt + self.sep if system_prompt else ""  # add separator for non-empty system prompt
-        messages = messages or self.messages
-        convs = []
-        for turn_idx, [user_query, bot_resp] in enumerate(messages):
-            if turn_idx == 0:
-                convs.append(system_prompt + self.prompt.format(query=user_query))
-                convs.append(bot_resp)
-            else:
-                convs.append(self.sep + self.prompt.format(query=user_query))
-                convs.append(bot_resp)
-        return convs
-
-    def append_message(self, query: str, answer: str):
-        """Append a new message."""
-        self.messages.append([query, answer])
-
-
-# A global registry for all conversation templates
-conv_templates: Dict[str, Conversation] = {}
-
-
-def register_conv_template(template: Conversation):
-    """Register a new conversation template."""
-    conv_templates[template.name] = template
-
-
-"""Vicuna v1.1 template
-Supports: https://huggingface.co/lmsys/vicuna-7b-delta-v1.1
-          https://huggingface.co/lmsys/vicuna-13b-delta-v1.1
-"""
-register_conv_template(
-    Conversation(
-        name="vicuna",
-        system_prompt="A chat between a curious user and an artificial intelligence assistant. "
-                      "The assistant gives helpful, detailed, and polite answers to the user's questions.",
-        messages=[],
-        roles=("USER", "ASSISTANT"),
-        prompt="USER: {query} ASSISTANT:",
-        sep="</s>",
-    )
-)
-
-"""Base model template, for few shot"""
-register_conv_template(
-    Conversation(
-        name="base",
-        system_prompt="",
-        messages=[],
-        roles=("USER", "ASSISTANT"),
-        prompt="{query}",
-        sep="</s>",
-    )
-)
-
-"""Alpaca template"""
-register_conv_template(
-    Conversation(
-        name="alpaca",
-        system_prompt="Below is an instruction that describes a task. "
-                      "Write a response that appropriately completes the request.",
-        messages=[],
-        roles=("### Instruction", "### Response"),
-        prompt="### Instruction:\n{query}\n\n### Response:\n",
-        sep="\n\n",
-    )
-)
-
-"""Baichuan template
-source: https://huggingface.co/baichuan-inc/Baichuan-13B-Chat/blob/main/generation_utils.py#L31
-Support: https://huggingface.co/baichuan-inc/Baichuan-13B-Chat
-"""
-register_conv_template(
-    Conversation(
-        name="baichuan",
-        system_prompt="",
-        messages=[],
-        roles=("<reserved_102>", "<reserved_103>"),
-        prompt="<reserved_102>{query}<reserved_103>",
-        sep="</s>",
-    )
-)
-
-"""Baichuan2 template
-Support: https://huggingface.co/baichuan-inc/Baichuan2-7B-Chat
-         https://huggingface.co/baichuan-inc/Baichuan2-13B-Chat
-"""
-register_conv_template(
-    Conversation(
-        name="baichuan2",
-        system_prompt="",
-        messages=[],
-        roles=("<reserved_106>", "<reserved_107>"),
-        prompt="<reserved_106>{query}<reserved_107>",
-        sep="</s>",
-    )
-)
-
-"""ziya template"""
-register_conv_template(
-    Conversation(
-        name="ziya",
-        system_prompt="",
-        messages=[],
-        roles=("<human>", "<bot>"),
-        prompt="<human>:{query}\n<bot>:",
-        sep="\n",
-    )
-)
-
-"""Linly template"""
-register_conv_template(
-    Conversation(
-        name="linly",
-        system_prompt="",
-        messages=[],
-        roles=("User", "Bot"),
-        prompt="User: {query}\nBot: ",
-        sep="\n",
-    )
-)
-
-"""ChatGLM1 template
-Support: https://huggingface.co/THUDM/chatglm-6b
-source: https://huggingface.co/THUDM/chatglm-6b/blob/main/modeling_chatglm.py#L1307
-"""
-register_conv_template(
-    Conversation(
-        name="chatglm",
-        system_prompt="",
-        messages=[],
-        roles=("问", "答"),
-        prompt="问：{query}\n答：",
-        sep="\n",
-    )
-)
-
-"""ChatGLM2 template
-Support: https://huggingface.co/THUDM/chatglm2-6b
-source: https://huggingface.co/THUDM/chatglm2-6b/blob/main/modeling_chatglm.py#L1007
-"""
-register_conv_template(
-    Conversation(
-        name="chatglm2",
-        system_prompt="",
-        messages=[],
-        roles=("问", "答"),
-        prompt="问：{query}\n\n答：",
-        sep="\n\n",
-    )
-)
-
-"""ChatGLM3 template
-Support: https://huggingface.co/THUDM/chatglm3-6b
-source: https://huggingface.co/THUDM/chatglm3-6b/blob/main/tokenization_chatglm.py#L179
-"""
-register_conv_template(
-    Conversation(
-        name="chatglm3",
-        system_prompt="",
-        messages=[],
-        roles=("<|user|>", "<|assistant|>"),
-        prompt="<|user|>\n{query}<|assistant|>",
-        sep="\n",
-        stop_str="<|user|>",
-    )
-)
-
-"""Phoenix template"""
-register_conv_template(
-    Conversation(
-        name="phoenix",
-        system_prompt="A chat between a curious human and an artificial intelligence assistant. "
-                      "The assistant gives helpful, detailed, and polite answers to the human's questions.\n\n",
-        messages=[],
-        roles=("Human", "Assistant"),
-        prompt="Human: <s>{query}</s>Assistant: ",
-        sep="</s>",
-    )
-)
-
-"""belle template
-Supports: https://huggingface.co/BelleGroup/BELLE-LLaMA-EXT-13B
-"""
-register_conv_template(
-    Conversation(
-        name="belle",
-        system_prompt="",
-        messages=[],
-        roles=("Human", "Belle"),
-        prompt="Human: {query}\n\nBelle: ",
-        sep="\n\n",
-    )
-)
-
-"""aquila template
-Supports: https://huggingface.co/qhduan/aquilachat-7b
-          https://huggingface.co/BAAI/AquilaChat2-34B
-"""
-register_conv_template(
-    Conversation(
-        name="aquila",
-        system_prompt="A chat between a curious human and an artificial intelligence assistant. "
-                      "The assistant gives helpful, detailed, and polite answers to the human's questions.",
-        messages=[],
-        roles=("Human", "Assistant"),
-        prompt="Human: {query}###Assistant:",
-        sep="###",
-    )
-)
-
-"""intern template
-Supports: https://huggingface.co/internlm/internlm-chat-7b
-          https://huggingface.co/internlm/internlm-chat-20b
-"""
-register_conv_template(
-    Conversation(
-        name="intern",
-        system_prompt="",
-        messages=[],
-        roles=("<|User|>", "<|Bot|>"),
-        prompt="<|User|>:{query}<eoh>\n<|Bot|>:",
-        sep="<eoa>\n",
-        stop_str="<eoa>",
-    )
-)
-
-"""StarChat template
-Supports: https://huggingface.co/HuggingFaceH4/starchat-alpha
-          https://huggingface.co/HuggingFaceH4/starchat-beta
-"""
-register_conv_template(
-    Conversation(
-        name="starchat",
-        system_prompt="<system>\n",
-        messages=[],
-        roles=("<|user|>", "<|assistant|>"),
-        prompt="<|user|>\n{query}<|end|>\n<|assistant|>\n",
-        sep="<|end|>\n",
-        stop_str="<|end|>",
-    )
-)
-
-"""llama2 template
-Supports: https://huggingface.co/meta-llama/Llama-2-7b-chat-hf
-          https://huggingface.co/meta-llama/Llama-2-13b-chat-hf
-          https://huggingface.co/meta-llama/Llama-2-70b-chat-hf
-reference: https://github.com/facebookresearch/llama/blob/cfc3fc8c1968d390eb830e65c63865e980873a06/llama/generation.py#L212
-"""
-register_conv_template(
-    Conversation(
-        name="llama2",
-        system_prompt="<<SYS>>\nYou are a helpful, respectful and honest assistant. "
-                      "Always answer as helpfully as possible, while being safe. "
-                      "Your answers should not include any harmful, unethical, racist, sexist, "
-                      "toxic, dangerous, or illegal content. "
-                      "Please ensure that your responses are socially unbiased and positive in nature.\n\n"
-                      "If a question does not make any sense, or is not factually coherent, "
-                      "explain why instead of answering something not correct. "
-                      "If you don't know the answer to a question, please don't share false information.\n<</SYS>>\n\n",
-        messages=[],
-        roles=("[INST]", "[/INST]"),
-        prompt="[INST] {query} [/INST]",
-        sep="</s>",
-    )
-)
-
-"""llama2-zh template
-source: https://github.com/ymcui/Chinese-LLaMA-Alpaca-2
-Supports: https://huggingface.co/ziqingyang/chinese-alpaca-2-7b
-"""
-register_conv_template(
-    Conversation(
-        name="llama2-zh",
-        system_prompt="[INST] <<SYS>>\nYou are a helpful assistant. 你是一个乐于助人的助手。\n<</SYS>>\n\n [/INST]",
-        messages=[],
-        roles=("[INST]", "[/INST]"),
-        prompt="[INST] {query} [/INST]",
-        sep="</s>",
-    )
-)
-
-"""mistral template
-Supports: https://huggingface.co/mistralai/Mistral-7B-v0.1
-          https://huggingface.co/HuggingFaceH4/zephyr-7b-beta
-source: https://docs.mistral.ai/llm/mistral-instruct-v0.1
-"""
-register_conv_template(
-    Conversation(
-        name="mistral",
-        system_prompt="",
-        messages=[],
-        roles=("[INST]", "[/INST]"),
-        prompt="[INST] {query} [/INST]",
-        sep="</s>",
-    )
-)
-
-"""XVERSE template
-Supports: https://huggingface.co/xverse/XVERSE-13B-Chat
-"""
-register_conv_template(
-    Conversation(
-        name="xverse",
-        system_prompt="",
-        messages=[],
-        roles=("Human", "Assistant"),
-        prompt="Human: {query}\n\nAssistant: ",
-        sep="</s>",
-    )
-)
-
-"""Qwen template
-Supports: https://huggingface.co/Qwen/Qwen-7B-Chat
-chatml: https://xbot123.com/645a461b922f176d7cfdbc2d/
-"""
-register_conv_template(
-    Conversation(
-        name="chatml",
-        system_prompt="You are a helpful assistant.",
-        messages=[],
-        roles=("user", "assistant"),
-        prompt="<|im_start|>user\n{query}<|im_end|>\n<|im_start|>assistant\n",
-        sep="<|im_end|>\n",
-        stop_str="<|im_end|>",
-    )
-)
-
-"""deepseek template
-Supports: https://huggingface.co/deepseek-ai/deepseek-llm-7b-chat
-          https://huggingface.co/deepseek-ai/deepseek-moe-16b-chat
-"""
-register_conv_template(
-    Conversation(
-        name="deepseek",
-        system_prompt="",
-        messages=[],
-        roles=("User", "Assistant"),
-        prompt="User: {query}\n\nAssistant:",
-        sep="</s>",
-    )
-)
-
-"""deepseekcoder template
-Supports: https://huggingface.co/deepseek-ai/deepseek-coder-33b-instruct
-"""
-register_conv_template(
-    Conversation(
-        name="deepseekcoder",
-        system_prompt=(
-            "You are an AI programming assistant, utilizing the Deepseek Coder model, "
-            "developed by Deepseek Company, and you only answer questions related to computer science. "
-            "For politically sensitive questions, security and privacy issues, "
-            "and other non-computer science questions, you will refuse to answer\n"
-        ),
-        messages=[],
-        roles=("### Instruction", "### Response"),
-        prompt="### Instruction:\n{{content}}\n### Response:\n",
-        sep="\n",
-        stop_str="<|EOT|>",
-    )
-)
-
-"""Yi template
-source: https://github.com/01-ai/Yi
-Supports: https://huggingface.co/01-ai/Yi-34B-Chat
-          https://huggingface.co/01-ai/Yi-6B-Chat
-"""
-register_conv_template(
-    Conversation(
-        name="yi",
-        system_prompt="",
-        messages=[],
-        roles=("user", "assistant"),
-        prompt="<|im_start|>user\n{query}<|im_end|>\n<|im_start|>assistant\n",
-        sep="\n",
-        stop_str="<|im_end|>",
-    )
-)
-
-"""Orion template
-source: https://github.com/OrionStarAI/Orion
-Supports: https://huggingface.co/OrionStarAI/Orion-14B-Chat
-"""
-register_conv_template(
-    Conversation(
-        name="orion",
-        system_prompt="",
-        messages=[],
-        roles=("Human", "Assistant"),
-        prompt="Human: {query}\n\nAssistant: </s>",
-        sep="</s>",
-    )
-)
-
-
-def get_conv_template(name: str) -> Conversation:
-    """Get a conversation template."""
-    return conv_templates[name]
 
 
 class SavePeftModelTrainer(Trainer):
@@ -768,6 +323,7 @@ def llama_torch_attn_forward(
         position_ids: Optional[torch.LongTensor] = None,
         past_key_value: Optional["Cache"] = None,
         output_attentions: bool = False,
+        cache_position: Optional[torch.LongTensor] = None,
         **kwargs,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
     bsz, q_len, _ = hidden_states.size()
@@ -780,15 +336,12 @@ def llama_torch_attn_forward(
     key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
     value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
-    kv_seq_len = key_states.shape[-2]
-    if past_key_value is not None:
-        kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
-
-    cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+    past_key_value = getattr(self, "past_key_value", past_key_value)
+    cos, sin = self.rotary_emb(value_states, position_ids)
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
     if past_key_value is not None:
-        cache_kwargs = {"sin": sin, "cos": cos}  # Specific to RoPE models
+        cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
         key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
     key_states = repeat_kv(key_states, self.num_key_value_groups)
@@ -846,8 +399,9 @@ def llama_flash_attn_forward(
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        past_key_value: Optional["Cache"] = None,
         output_attentions: bool = False,
+        cache_position: Optional[torch.LongTensor] = None,
         **kwargs,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
     # LlamaFlashAttention2 attention does not support output_attentions
@@ -864,15 +418,13 @@ def llama_flash_attn_forward(
     key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
     value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
-    kv_seq_len = key_states.shape[-2]
-    if past_key_value is not None:
-        kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+    cos, sin = self.rotary_emb(value_states, position_ids)
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
-    cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+    past_key_value = getattr(self, "past_key_value", past_key_value)
 
     if past_key_value is not None:
-        cache_kwargs = {"sin": sin, "cos": cos}  # Specific to RoPE models
+        cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
         key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
     key_states = repeat_kv(key_states, self.num_key_value_groups)
@@ -941,41 +493,6 @@ def apply_llama_patch() -> None:
     LlamaFlashAttention2.forward = llama_flash_attn_forward
 
 
-def mlp_forward(self: "MixtralBLockSparseTop2MLP", hidden_states: torch.Tensor) -> torch.Tensor:
-    current_hidden_states = self.act_fn(self.w1(hidden_states)) * self.w3(hidden_states)
-    current_hidden_states = self.w2(current_hidden_states)
-    return current_hidden_states
-
-
-# Modified from: https://huggingface.co/deepseek-ai/deepseek-moe-16b-base/blob/main/modeling_deepseek.py
-def moe_forward(self: "MixtralSparseMoeBlock", hidden_states: torch.Tensor):
-    batch_size, sequence_length, hidden_dim = hidden_states.shape
-    hidden_states = hidden_states.view(-1, hidden_dim)
-    # router_logits: (batch * sequence_length, n_experts)
-    router_logits = self.gate(hidden_states)
-
-    routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
-    topk_weight, topk_idx = torch.topk(routing_weights, self.top_k, dim=-1, sorted=False)
-    topk_weight /= topk_weight.sum(dim=-1, keepdim=True)
-    # we cast back to the input dtype
-    topk_weight = topk_weight.to(hidden_states.dtype)
-
-    hidden_states = hidden_states.repeat_interleave(self.top_k, dim=0)
-    y = torch.empty_like(hidden_states)
-    flat_topk_idx = topk_idx.view(-1)
-    for i in range(self.num_experts):
-        expert = self.experts[i]
-        y[flat_topk_idx == i] = expert(hidden_states[flat_topk_idx == i])
-    y = (y.view(*topk_weight.shape, -1) * topk_weight.unsqueeze(-1)).sum(dim=1)
-    final_hidden_states = y.reshape(batch_size, sequence_length, hidden_dim)
-    return final_hidden_states, router_logits
-
-
-def patch_mixtral_replace_moe_impl() -> None:
-    MixtralBLockSparseTop2MLP.forward = mlp_forward
-    MixtralSparseMoeBlock.forward = moe_forward
-
-
 def main():
     parser = HfArgumentParser((ModelArguments, DataArguments, Seq2SeqTrainingArguments, ScriptArguments))
     model_args, data_args, training_args, script_args = parser.parse_args_into_dataclasses()
@@ -1003,18 +520,23 @@ def main():
     if not tokenizer_name_or_path:
         tokenizer_name_or_path = model_args.model_name_or_path
     tokenizer = tokenizer_class.from_pretrained(tokenizer_name_or_path, **tokenizer_kwargs)
-    prompt_template = get_conv_template(data_args.template_name)
+    prompt_template = get_conv_template(script_args.template_name)
     if tokenizer.eos_token_id is None:
-        tokenizer.eos_token = prompt_template.stop_str  # eos token is required for SFT
-        logger.info("Add eos token: {}".format(tokenizer.eos_token))
+        tokenizer.eos_token = prompt_template.stop_str  # eos token is required
+        tokenizer.add_special_tokens({"eos_token": tokenizer.eos_token})
+        logger.info(f"Add eos_token: {tokenizer.eos_token}, eos_token_id: {tokenizer.eos_token_id}")
+    if tokenizer.bos_token_id is None:
+        tokenizer.add_special_tokens({"bos_token": tokenizer.eos_token})
+        tokenizer.bos_token_id = tokenizer.eos_token_id
+        logger.info(f"Add bos_token: {tokenizer.bos_token}, bos_token_id: {tokenizer.bos_token_id}")
     if tokenizer.pad_token_id is None:
         if tokenizer.unk_token_id is not None:
             tokenizer.pad_token = tokenizer.unk_token
         else:
             tokenizer.pad_token = tokenizer.eos_token
-        logger.info("Add pad token: {}".format(tokenizer.pad_token))
-
+        logger.info(f"Add pad_token: {tokenizer.pad_token}, pad_token_id: {tokenizer.pad_token_id}")
     logger.debug(f"Tokenizer: {tokenizer}")
+
     IGNORE_INDEX = LabelSmoother.ignore_index if data_args.ignore_pad_token_for_loss else tokenizer.pad_token_id
 
     # Get datasets
@@ -1078,6 +600,7 @@ def main():
         roles = ["human", "gpt"]
 
         def get_dialog(examples):
+            system_prompts = examples.get("system_prompt", "")
             for i, source in enumerate(examples['conversations']):
                 if len(source) < 2:
                     continue
@@ -1099,7 +622,8 @@ def main():
                     continue
                 # Convert the list to pairs of elements
                 history_messages = [[messages[k], messages[k + 1]] for k in range(0, len(messages), 2)]
-                yield prompt_template.get_dialog(history_messages)
+                system_prompt = system_prompts[i] if system_prompts else None
+                yield prompt_template.get_dialog(history_messages, system_prompt=system_prompt)
 
         for dialog in get_dialog(examples):
             input_ids, labels = [], []
@@ -1166,10 +690,10 @@ def main():
             train_dataset = train_dataset.filter(filter_empty_labels, num_proc=data_args.preprocessing_num_workers)
             logger.debug(f"Num train_samples: {len(train_dataset)}")
             logger.debug("Tokenized training example:")
-            logger.debug(f"Decode input_ids[0]: {tokenizer.decode(train_dataset[0]['input_ids'])}")
+            logger.debug(f"Decode input_ids[0]:\n{tokenizer.decode(train_dataset[0]['input_ids'])}")
             replaced_labels = [label if label != IGNORE_INDEX else tokenizer.pad_token_id
                                for label in list(train_dataset[0]['labels'])]
-            logger.debug(f"Decode labels[0]: {tokenizer.decode(replaced_labels)}")
+            logger.debug(f"Decode labels[0]:\n{tokenizer.decode(replaced_labels)}")
 
     eval_dataset = None
     max_eval_samples = 0
@@ -1256,16 +780,16 @@ def main():
                 logger.warning("FlashAttention-2 is not installed.")
         elif model_args.shift_attn and getattr(config, "model_type", None) == "llama":
             logger.warning("Using `--flash_attn` for faster training in large context length, enable if your GPU"
-                           " is RTX4090, A100 or H100.")
+                           " is RTX3090, RTX4090, A100 or H100.")
 
-        # Set shift short attention (S^2-Attn)
+        # Set shifted sparse attention (S^2-Attn)
         if model_args.shift_attn:
             if getattr(config, "model_type", None) == "llama":
                 setattr(config, "group_size_ratio", 0.25)
                 apply_llama_patch()
-                logger.info("Using shift short attention with group_size_ratio=1/4.")
+                logger.info("Using shifted sparse attention with group_size_ratio=1/4.")
             else:
-                logger.warning("Current model does not support shift short attention.")
+                logger.warning("Current model does not support shifted sparse attention.")
 
         load_in_4bit = model_args.load_in_4bit
         load_in_8bit = model_args.load_in_8bit
@@ -1328,7 +852,6 @@ def main():
             from transformers.models.mixtral.modeling_mixtral import MixtralSparseMoeBlock  # type: ignore
 
             set_z3_leaf_modules(model, [MixtralSparseMoeBlock])
-            patch_mixtral_replace_moe_impl()
     else:
         raise ValueError(f"Error, model_name_or_path is None, SFT must be loaded from a pre-trained model")
 
@@ -1394,7 +917,7 @@ def main():
         tokenizer=tokenizer,
         model=model,
         label_pad_token_id=IGNORE_INDEX,
-        pad_to_multiple_of=4 if tokenizer.padding_side == "right" else None,  # for shift short attention
+        pad_to_multiple_of=4 if tokenizer.padding_side == "right" else None,  # for shifted sparse attention
     )
     # Initialize our Trainer
     trainer = SavePeftModelTrainer(
@@ -1412,11 +935,11 @@ def main():
         if trainer.is_world_process_zero():
             sample = next(iter(trainer.get_train_dataloader()))
             logger.debug(f"Train dataloader example: {sample}")
-            logger.debug(f"Detail input_ids: {list(sample['input_ids'])[:3]}, \nlabels: {list(sample['labels'])[:3]}")
-            logger.debug(f"Decode input_ids[0]: {tokenizer.decode(sample['input_ids'][0])}")
+            logger.debug(f"input_ids:\n{list(sample['input_ids'])[:3]}, \nlabels:\n{list(sample['labels'])[:3]}")
+            logger.debug(f"Decode input_ids[0]:\n{tokenizer.decode(sample['input_ids'][0])}")
             replaced_labels = [label if label != IGNORE_INDEX else tokenizer.pad_token_id for label in
                                sample['labels'][0]]
-            logger.debug(f"Decode labels[0]: {tokenizer.decode(replaced_labels)}")
+            logger.debug(f"Decode labels[0]:\n{tokenizer.decode(replaced_labels)}")
         checkpoint = None
         if training_args.resume_from_checkpoint is not None:
             checkpoint = training_args.resume_from_checkpoint

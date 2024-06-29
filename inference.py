@@ -17,18 +17,18 @@ from transformers import (
     AutoTokenizer,
     BloomForCausalLM,
     BloomTokenizerFast,
-    LlamaTokenizer,
     LlamaForCausalLM,
     TextIteratorStreamer,
     GenerationConfig,
+    BitsAndBytesConfig,
 )
 
-from supervised_finetuning import get_conv_template
+from template import get_conv_template
 
 MODEL_CLASSES = {
     "bloom": (BloomForCausalLM, BloomTokenizerFast),
     "chatglm": (AutoModel, AutoTokenizer),
-    "llama": (LlamaForCausalLM, LlamaTokenizer),
+    "llama": (LlamaForCausalLM, AutoTokenizer),
     "baichuan": (AutoModelForCausalLM, AutoTokenizer),
     "auto": (AutoModelForCausalLM, AutoTokenizer),
 }
@@ -42,7 +42,7 @@ def stream_generate_answer(
         device,
         do_print=True,
         max_new_tokens=512,
-        do_sample=False,
+        temperature=0.7,
         repetition_penalty=1.0,
         context_len=2048,
         stop_str="</s>",
@@ -55,7 +55,8 @@ def stream_generate_answer(
     generation_kwargs = dict(
         input_ids=torch.as_tensor([input_ids]).to(device),
         max_new_tokens=max_new_tokens,
-        do_sample=do_sample,
+        temperature=temperature,
+        do_sample=True if temperature > 0.0 else False,
         repetition_penalty=repetition_penalty,
         streamer=streamer,
     )
@@ -85,9 +86,10 @@ def batch_generate_answer(
         model,
         tokenizer,
         prompt_template,
+        system_prompt,
         device,
         max_new_tokens=512,
-        do_sample=False,
+        temperature=0.7,
         repetition_penalty=1.0,
         stop_str="</s>",
 ):
@@ -95,10 +97,12 @@ def batch_generate_answer(
     generated_texts = []
     generation_kwargs = dict(
         max_new_tokens=max_new_tokens,
-        do_sample=do_sample,
+        temperature=temperature,
+        do_sample=True if temperature > 0.0 else False,
         repetition_penalty=repetition_penalty,
     )
-    prompts = [prompt_template.get_prompt(messages=[[s, '']]) for s in sentences]
+    messages = [[s, ''] for s in sentences]
+    prompts = [prompt_template.get_prompt(messages=messages, system_prompt=system_prompt)]
     inputs_tokens = tokenizer(prompts, return_tensors="pt", padding=True)
     input_ids = inputs_tokens['input_ids'].to(device)
     outputs = model.generate(input_ids=input_ids, **generation_kwargs)
@@ -117,46 +121,47 @@ def batch_generate_answer(
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model_type', default=None, type=str, required=True)
+    parser.add_argument('--model_type', default='auto', type=str)
     parser.add_argument('--base_model', default=None, type=str, required=True)
     parser.add_argument('--lora_model', default="", type=str, help="If None, perform inference on the base model")
     parser.add_argument('--tokenizer_path', default=None, type=str)
     parser.add_argument('--template_name', default="vicuna", type=str,
                         help="Prompt template name, eg: alpaca, vicuna, baichuan, chatglm2 etc.")
+    parser.add_argument('--system_prompt', default="", type=str)
     parser.add_argument("--repetition_penalty", type=float, default=1.0)
     parser.add_argument("--max_new_tokens", type=int, default=512)
     parser.add_argument('--data_file', default=None, type=str,
                         help="A file that contains instructions (one instruction per line)")
     parser.add_argument('--interactive', action='store_true', help="run in the instruction mode (default multi-turn)")
     parser.add_argument('--single_tune', action='store_true', help='Whether to use single-tune model')
-    parser.add_argument('--do_sample', action='store_true', help='Whether to use sampling in generation')
+    parser.add_argument('--temperature', type=float, default=0.7)
     parser.add_argument('--output_file', default='./predictions_result.jsonl', type=str)
     parser.add_argument("--eval_batch_size", type=int, default=4)
     parser.add_argument('--resize_emb', action='store_true', help='Whether to resize model token embeddings')
-    parser.add_argument('--only_cpu', action='store_true', help='only use CPU for inference')
     parser.add_argument('--load_in_8bit', action='store_true', help='Whether to load model in 8bit')
     parser.add_argument('--load_in_4bit', action='store_true', help='Whether to load model in 4bit')
     args = parser.parse_args()
     print(args)
-    load_type = torch.float16
-    if torch.cuda.is_available() and not args.only_cpu:
-        device = torch.device(0)
-    else:
-        device = torch.device('cpu')
+    load_type = 'auto'
     if args.tokenizer_path is None:
         args.tokenizer_path = args.base_model
 
     model_class, tokenizer_class = MODEL_CLASSES[args.model_type]
     tokenizer = tokenizer_class.from_pretrained(args.tokenizer_path, trust_remote_code=True, padding_side='left')
-    base_model = model_class.from_pretrained(
-        args.base_model,
-        load_in_8bit=args.load_in_8bit,
-        load_in_4bit=args.load_in_4bit,
-        torch_dtype=load_type,
-        low_cpu_mem_usage=True,
-        device_map='auto',
-        trust_remote_code=True,
-    )
+    config_kwargs = {
+        "trust_remote_code": True,
+        "torch_dtype": load_type,
+        "low_cpu_mem_usage": True,
+        "device_map": 'auto',
+    }
+    if args.load_in_8bit:
+        config_kwargs['quantization_config'] = BitsAndBytesConfig(load_in_8bit=True)
+    elif args.load_in_4bit:
+        config_kwargs['quantization_config'] = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=load_type,
+        )
+    base_model = model_class.from_pretrained(args.base_model, **config_kwargs)
     try:
         base_model.generation_config = GenerationConfig.from_pretrained(args.base_model, trust_remote_code=True)
     except OSError:
@@ -175,8 +180,6 @@ def main():
         print("Loaded lora model")
     else:
         model = base_model
-    if device == torch.device('cpu'):
-        model.float()
     model.eval()
     print(tokenizer)
     # test data
@@ -191,6 +194,7 @@ def main():
 
     # Chat
     prompt_template = get_conv_template(args.template_name)
+    system_prompt = args.system_prompt
     stop_str = tokenizer.eos_token if tokenizer.eos_token else prompt_template.stop_str
 
     if args.interactive:
@@ -220,15 +224,15 @@ def main():
                 history = []
 
             history.append([query, ''])
-            prompt = prompt_template.get_prompt(messages=history)
+            prompt = prompt_template.get_prompt(messages=history, system_prompt=system_prompt)
             response = stream_generate_answer(
                 model,
                 tokenizer,
                 prompt,
-                device,
+                model.device,
                 do_print=True,
                 max_new_tokens=args.max_new_tokens,
-                do_sample=args.do_sample,
+                temperature=args.temperature,
                 repetition_penalty=args.repetition_penalty,
                 stop_str=stop_str,
             )
@@ -252,9 +256,10 @@ def main():
                 model,
                 tokenizer,
                 prompt_template,
-                device,
+                system_prompt,
+                model.device,
                 max_new_tokens=args.max_new_tokens,
-                do_sample=args.do_sample,
+                temperature=args.temperature,
                 repetition_penalty=args.repetition_penalty,
                 stop_str=stop_str,
             )
