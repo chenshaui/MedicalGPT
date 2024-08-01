@@ -1,23 +1,8 @@
 # -*- coding: utf-8 -*-
-# Copyright 2023 XuMing(xuming624@qq.com) and The HuggingFace Inc. team. All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 """
-Fine-tuning the library models for causal language modeling (GPT, LLaMA, Bloom, ...) on a json file or a dataset.
-
-part of code is modified from https://github.com/shibing624/textgen
+@author:Xialie Zhuang(1832963123@qq.com)
+@description: Train a model from base model using Full train
 """
-
 import math
 import os
 from dataclasses import dataclass, field
@@ -29,7 +14,6 @@ import torch
 import torch.nn as nn
 from datasets import load_dataset
 from loguru import logger
-from peft import LoraConfig, TaskType, get_peft_model, PeftModel, prepare_model_for_kbit_training
 from transformers import (
     AutoConfig,
     BloomForCausalLM,
@@ -133,7 +117,7 @@ class ModelArguments:
         },
     )
     device_map: Optional[str] = field(
-        default="auto",
+        default=None,
         metadata={"help": "Device to map model to. If `auto` is passed, the device will be selected automatically. "},
     )
     trust_remote_code: bool = field(
@@ -223,7 +207,7 @@ class DataArguments:
 
 @dataclass
 class ScriptArguments:
-    use_peft: bool = field(default=True, metadata={"help": "Whether to use peft"})
+    use_peft: bool = field(default=False, metadata={"help": "Whether to use peft"})
     train_on_inputs: bool = field(default=False, metadata={"help": "Whether to train on inputs"})
     target_modules: Optional[str] = field(default="all")
     lora_rank: Optional[int] = field(default=8)
@@ -737,8 +721,6 @@ def main():
         if ddp:
             model_args.device_map = {"": int(os.environ.get("LOCAL_RANK", "0"))}
             training_args.gradient_accumulation_steps = training_args.gradient_accumulation_steps // world_size or 1
-        if script_args.qlora and (len(training_args.fsdp) > 0 or is_deepspeed_zero3_enabled()):
-            logger.warning("FSDP and DeepSpeed ZeRO-3 are both currently incompatible with QLoRA.")
 
         config_kwargs = {
             "trust_remote_code": model_args.trust_remote_code,
@@ -819,13 +801,11 @@ def main():
             model_args.model_name_or_path,
             config=config,
             torch_dtype=torch_dtype,
-            low_cpu_mem_usage=(not is_deepspeed_zero3_enabled()),
-            device_map=model_args.device_map,
             **config_kwargs,
         )
 
-        # Fix ChatGLM2 and ChatGLM3 and internlm2 LM head
-        if getattr(config, "model_type", None) == "chatglm" or getattr(config, "model_type", None) == "internlm2":
+        # Fix ChatGLM2 and ChatGLM3 LM head
+        if getattr(config, "model_type", None) == "chatglm":
             setattr(model, "lm_head", model.transformer.output_layer)
             setattr(model, "_keys_to_ignore_on_save", ["lm_head.weight"])
 
@@ -855,49 +835,10 @@ def main():
     else:
         raise ValueError(f"Error, model_name_or_path is None, SFT must be loaded from a pre-trained model")
 
-    if script_args.use_peft:
-        logger.info("Fine-tuning method: LoRA(PEFT)")
-
-        # Set fp32 forward hook for lm_head
-        output_layer = getattr(model, "lm_head")
-        if isinstance(output_layer, torch.nn.Linear) and output_layer.weight.dtype != torch.float32:
-            def fp32_forward_post_hook(module: torch.nn.Module, args: Tuple[torch.Tensor], output: torch.Tensor):
-                return output.to(torch.float32)
-
-            output_layer.register_forward_hook(fp32_forward_post_hook)
-
-        # Load LoRA model
-        if script_args.peft_path is not None:
-            logger.info(f"Peft from pre-trained model: {script_args.peft_path}")
-            model = PeftModel.from_pretrained(model, script_args.peft_path, is_trainable=True)
-        else:
-            logger.info("Init new peft model")
-            if load_in_8bit or load_in_4bit:
-                model = prepare_model_for_kbit_training(model, training_args.gradient_checkpointing)
-            target_modules = script_args.target_modules.split(',') if script_args.target_modules else None
-            if target_modules and 'all' in target_modules:
-                target_modules = find_all_linear_names(model, int4=load_in_4bit, int8=load_in_8bit)
-            modules_to_save = script_args.modules_to_save
-            if modules_to_save is not None:
-                modules_to_save = modules_to_save.split(',')
-            logger.info(f"Peft target_modules: {target_modules}")
-            logger.info(f"Peft lora_rank: {script_args.lora_rank}")
-            peft_config = LoraConfig(
-                task_type=TaskType.CAUSAL_LM,
-                target_modules=target_modules,
-                inference_mode=False,
-                r=script_args.lora_rank,
-                lora_alpha=script_args.lora_alpha,
-                lora_dropout=script_args.lora_dropout,
-                modules_to_save=modules_to_save)
-            model = get_peft_model(model, peft_config)
-        for param in filter(lambda p: p.requires_grad, model.parameters()):
-            param.data = param.data.to(torch.float32)
-        model.print_trainable_parameters()
-    else:
-        logger.info("Fine-tuning method: Full parameters training")
-        model = model.float()
-        print_trainable_parameters(model)
+    # Full parameters training
+    logger.info("Fine-tuning method: Full parameters training")
+    model = model.float()
+    print_trainable_parameters(model)
 
     # Initialize our Trainer
     if training_args.gradient_checkpointing and getattr(model, "supports_gradient_checkpointing", False):
@@ -920,7 +861,7 @@ def main():
         pad_to_multiple_of=4 if tokenizer.padding_side == "right" else None,  # for shifted sparse attention
     )
     # Initialize our Trainer
-    trainer = SavePeftModelTrainer(
+    trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset if training_args.do_train else None,
